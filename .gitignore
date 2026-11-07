@@ -1,0 +1,13 @@
+# секреты и локальные данные
+.env
+data/
+*.db
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+# macOS
+.DS_Store
+*.zip
