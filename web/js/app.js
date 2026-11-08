@@ -1,6 +1,6 @@
 // Точка входа: роутинг по hash, роль, режим встраивания (?embed=1, ?conversationId=...).
 import { api } from "./api.js";
-import { errorToast, esc, state } from "./ui.js";
+import { closeModals, errorToast, esc, icon, refreshJobs, state } from "./ui.js";
 import { renderDialogs } from "./views/dialogs.js";
 import { renderDialog } from "./views/dialog.js";
 import { renderAppeals } from "./views/appeals.js";
@@ -27,8 +27,12 @@ function parseHash() {
 let renderSeq = 0;
 async function route() {
   const root = document.getElementById("app");
+  const urlRole = new URLSearchParams(location.search).get('role') === 'reviewer' ? 'reviewer' : 'operator';
+  if (state.role !== urlRole) setRole(urlRole);
   const seq = ++renderSeq;
-  document.getElementById("modal-root").replaceChildren();
+  closeModals();
+  document.querySelector('.topbar').classList.remove('menu-open');
+  document.querySelector('.nav-toggle').setAttribute('aria-expanded', 'false');
   root.innerHTML = `<div class="loading">Загрузка…</div>`;
   try {
     const { name, params, query } = parseHash();
@@ -41,7 +45,8 @@ async function route() {
     await view(root, params, query, () => seq === renderSeq);
   } catch (e) {
     if (seq === renderSeq) {
-      root.innerHTML = `<div class="empty">Не удалось загрузить: ${esc(e.message || e)}</div>`;
+      root.innerHTML = `<div class="empty" role="alert"><h1>Не удалось загрузить экран</h1><p>${esc(e.message || e)}</p><button class="btn primary" data-retry>Повторить запрос</button></div>`;
+      root.querySelector('[data-retry]').addEventListener('click', route);
       errorToast(e);
     }
   }
@@ -58,6 +63,7 @@ function setRole(role) {
   url.searchParams.set("role", role);
   history.replaceState(null, "", url);
   document.querySelectorAll("#roleSwitch button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.role === role)));
+  document.querySelectorAll('[data-reviewer-nav]').forEach((el) => { el.hidden = role !== 'reviewer'; });
 }
 
 async function refreshAppealsBadge() {
@@ -75,7 +81,26 @@ function init() {
   if (cid) history.replaceState(null, "", `${location.pathname}${location.search}#/dialog/${encodeURIComponent(cid)}`);
   else if (!location.hash) history.replaceState(null, "", `${location.pathname}${location.search}#/dialogs`);
   document.querySelectorAll("#roleSwitch button").forEach((b) => b.addEventListener("click", () => { setRole(b.dataset.role); route(); }));
+  const menu = document.querySelector('.nav-toggle');
+  document.querySelector('.skip-link').addEventListener('click', (event) => { event.preventDefault(); document.getElementById('app').focus(); });
+  menu.innerHTML = `${icon('menu')} Меню`;
+  menu.addEventListener('click', () => {
+    const open = document.querySelector('.topbar').classList.toggle('menu-open');
+    menu.setAttribute('aria-expanded', String(open));
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && document.querySelector('.topbar').classList.contains('menu-open')) {
+      document.querySelector('.topbar').classList.remove('menu-open');
+      menu.setAttribute('aria-expanded', 'false'); menu.focus();
+    }
+  });
   window.addEventListener("hashchange", route);
+  window.addEventListener('popstate', () => {
+    const urlRole = new URLSearchParams(location.search).get('role') === 'reviewer' ? 'reviewer' : 'operator';
+    if (urlRole !== state.role) route();
+  });
+  refreshJobs().catch(() => {});
+  setInterval(() => { if (!document.hidden) refreshJobs().catch(() => {}); }, 2500);
   route();
 }
 

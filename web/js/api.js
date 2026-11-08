@@ -19,6 +19,9 @@ async function request(method, path, body) {
   if (!res.ok) {
     let msg = `Ошибка ${res.status}`;
     if (data && data.detail) msg = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+    if (res.status >= 500) msg = 'Сервер не смог выполнить запрос. Попробуйте ещё раз.';
+    msg = msg.replace(/(api[_-]?key|authorization|token|secret)([\s"':=]+)[^\s,"'}]+/gi, '$1: [скрыто]')
+      .replace(/\b(?:AIza[\w-]{20,}|sk-[\w-]{16,})\b/g, '[ключ скрыт]');
     throw new Error(msg);
   }
   return data;
