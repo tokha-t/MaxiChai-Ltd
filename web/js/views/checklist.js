@@ -1,6 +1,6 @@
 // Экран «Чек-лист»: версии, редактор критериев, сохранение новой версии, применение к диалогам и разница итогов.
 import { api, qs } from "../api.js";
-import { errorToast, esc, fmtScore, jobBox, modal, notifyJobStarted, pollJob, refreshJobs, state, toast } from "../ui.js";
+import { errorToast, esc, fmtScore, icon, jobBox, modal, notifyJobStarted, pollJob, refreshJobs, state, toast } from "../ui.js";
 
 let draft = null;       // редактируемая копия
 let baseId = null;      // id версии, от которой редактируем
@@ -101,10 +101,10 @@ export async function renderChecklist(root, params = [], query = null, alive = (
             <label class="field"><span>Порог первой реакции, сек</span><input type="number" min="1" step="1" data-top="first_response_threshold_sec" style="width:120px"></label>
           </div>
           <label class="field"><span>Общие правила (передаются модели)</span><textarea rows="2" data-top="notes"></textarea></label>
-          <div><span class="muted small">Секции</span><div data-sections></div><button class="btn small" data-act="add-section">＋ секция</button></div>
+          <div><span class="muted small">Секции</span><div data-sections></div><button class="btn small" data-act="add-section">${icon('plus')} Добавить секцию</button></div>
         </div>
         <div class="card" data-criteria></div>
-        <button class="btn" data-act="add-criterion">＋ Добавить критерий</button>
+        <button class="btn" data-act="add-criterion">${icon('plus')} Добавить критерий</button>
       </section>
     </div>`;
 

@@ -64,7 +64,7 @@ export async function renderDashboard(root, params = [], query = null, alive = (
 
   const criterionAction = (criterion) => canFilterCriterion
     ? `<a class="btn" data-dialog-filter href="${esc(listHref(selectedGroup, { criterion_id: criterion.criterion_id, criterion_violation: true, sort: "score_asc" }))}" aria-label="Показать диалоги с нарушением критерия ${esc(criterion.name || criterion.criterion_id)}">Показать нарушения: ${count(criterion.fail)}</a>`
-    : `<span class="muted small">Отбор диалогов по этому критерию пока недоступен.</span>`;
+    : "";
 
   root.innerHTML = `
     <div class="page-head"><h1>Дашборд</h1>
@@ -83,6 +83,7 @@ export async function renderDashboard(root, params = [], query = null, alive = (
     <section class="card card-pad dashboard-criteria" aria-labelledby="dashboard-criteria-title">
       <div class="row"><h2 id="dashboard-criteria-title">Выполнение критериев</h2><span class="spacer"></span><label class="field"><span>Сортировать критерии</span><select data-order><option value="violations" ${criterionSort === "violations" ? "selected" : ""}>Сначала больше нарушений</option><option value="rate" ${criterionSort === "rate" ? "selected" : ""}>Сначала ниже доля баллов</option></select></label></div>
       <p class="muted small">Доля набранных баллов рассчитана только среди применимых оценок. База каждого критерия — оценки, в которых он присутствует.</p>
+      ${canFilterCriterion ? "" : `<p class="muted small">Отбор диалогов по отдельному критерию пока недоступен.</p>`}
       <div class="dashboard-criterion-list" data-criteria-list></div>
     </section>
     <section class="card card-pad dashboard-languages" aria-labelledby="dashboard-language-title"><h2 id="dashboard-language-title">Средний итог по языкам</h2>

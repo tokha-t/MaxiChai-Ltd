@@ -364,6 +364,7 @@ input[type=checkbox], input[type=radio] { width: 18px; height: 18px; accent-colo
 .appeal-heading h2 { font-size: 17px; }
 .appeal-timeline { margin: 12px 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
 .appeal-timeline li { padding: 4px 0; }
+.appeal-timeline li > b, .appeal-timeline li > span { display: block; }
 .ai-recommendation { background: #f1f4f7; color: #344250; border: 1px solid #d7dfe6; }
 .human-decision-status { font-weight: 600; margin-top: 12px; }
 .decision { margin: 0; min-width: 0; }

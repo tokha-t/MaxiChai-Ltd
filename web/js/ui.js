@@ -34,7 +34,7 @@ export function errorToast(e) {
 export function modal({ title, body, actions = [], wide = false }) {
   const root = document.getElementById("modal-root");
   const back = h(`<div class="modal-back"><div class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}" style="${wide ? "width:min(960px,100%)" : ""}">
-      <div class="modal-head"><h2>${esc(title)}</h2><span class="spacer"></span><button class="btn ghost" data-x aria-label="Закрыть">✕</button></div>
+      <div class="modal-head"><h2>${esc(title)}</h2><span class="spacer"></span><button class="btn ghost" data-x aria-label="Закрыть">${icon('close')}</button></div>
       <div class="modal-body"></div><div class="modal-foot"></div></div></div>`);
   const bodyEl = back.querySelector(".modal-body");
   if (typeof body === "string") bodyEl.innerHTML = body; else if (body) bodyEl.appendChild(body);
