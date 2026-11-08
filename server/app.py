@@ -578,14 +578,18 @@ def results_save(body: Dict[str, Any] = Body(...)):
 @app.get("/api/stats")
 def stats(group_id: Optional[str] = None):
     evs = []
-    for c in store.list_conversations(group_id):
+    conversations_in_group = store.list_conversations(group_id)
+    conversation_ids = {c["conversation_id"] for c in conversations_in_group}
+    for c in conversations_in_group:
         ev = final_view(store.latest_evaluation(c["conversation_id"]))
         if ev and ev.get("status") == "ok":
             evs.append(ev)
     per_crit = defaultdict(lambda: {"n": 0, "applicable": 0, "points": 0.0, "max": 0.0, "na": 0, "fail": 0, "name": ""})
     by_lang = defaultdict(list)
     for ev in evs:
-        by_lang[(ev.get("language") or "—")].append(ev["final"]["score"]["final_score"])
+        score = ev["final"]["score"]["final_score"]
+        if score is not None:
+            by_lang[(ev.get("language") or "—")].append(score)
         for r in ev["final"]["criteria"]:
             s = per_crit[r["criterion_id"]]
             s["name"] = r["name"]
@@ -607,7 +611,7 @@ def stats(group_id: Optional[str] = None):
         "avg_score": round(sum(scores) / len(scores), 2) if scores else None,
         "critical_count": sum(1 for e in evs if e["final"]["score"]["critical_flag"]),
         "needs_review_count": sum(1 for e in evs if any(r.get("needs_review") for r in e["criteria"])),
-        "open_appeals": len(store.list_appeals(status="open")),
+        "open_appeals": sum(1 for a in store.list_appeals(status="open") if a["conversation_id"] in conversation_ids),
         "total_cost_usd": round(sum((e.get("usage") or {}).get("cost_usd") or 0 for e in evs), 4),
         "avg_cost_usd": round(sum((e.get("usage") or {}).get("cost_usd") or 0 for e in evs) / len(evs), 5) if evs else None,
         "criteria": [{"criterion_id": k, **{kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()},
