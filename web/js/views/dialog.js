@@ -13,6 +13,7 @@ export async function renderDialog(root, params = [], query = null, alive = () =
   if (!isCurrent()) return;
   const { conversation: conv, turns, facts, evaluation: ev, history: hist, appeals } = data;
   const isCall = (conv.channel || "").toLowerCase().includes("call");
+  const audioUrl = safeAudioUrl(conv.audio_url);
   const ok = ev && ev.status === "ok";
   const finalRows = ok ? ev.final.criteria : [];
   const finalScore = ok ? ev.final.score : null;
@@ -21,6 +22,7 @@ export async function renderDialog(root, params = [], query = null, alive = () =
   for (const a of appeals || []) if (ok && a.evaluation_id === ev._id) (appealsByCrit[a.criterion_id] = appealsByCrit[a.criterion_id] || []).push(a);
   const holdRanges = facts.hold_ranges || [];
   const inHold = (n) => holdRanges.some(([a, b]) => n > a && n < b);
+  const recordingGaps = facts.recording_gaps || [];
   const reload = async () => {
     if (!isCurrent()) return;
     try { await renderDialog(root, params, null, alive); }
@@ -43,11 +45,11 @@ export async function renderDialog(root, params = [], query = null, alive = () =
       <section class="card transcript" id="transcript">
         <div class="transcript-head">
           <div class="row"><b>Транскрипт</b><span class="muted small">${turns.length} реплик · номера [n] — как в результатах</span></div>
-          ${isCall ? `<div style="margin-top:8px">${conv.audio_url ? `<audio controls preload="none" src="${esc(conv.audio_url)}" id="player"></audio>
-            <div class="small muted">Клик по номеру реплики перематывает запись. Если плеер не играет — <a href="${esc(conv.audio_url)}" target="_blank" rel="noopener">открыть запись</a>.</div>` : ""}
+          ${isCall ? `<div style="margin-top:8px">${audioUrl ? `<audio controls preload="none" src="${esc(audioUrl)}" id="player"></audio>
+            <div class="small muted">Клик по реплике перематывает запись. Если плеер не играет — <a href="${esc(audioUrl)}" target="_blank" rel="noopener">Открыть запись</a>.</div>` : `<div class="small muted">Запись недоступна.</div>`}
             <div class="small muted">Транскрипт звонка распознан автоматически; удержание и паузы записи отмечены.</div></div>` : ""}
         </div>
-        <div class="turns">${turns.map((t) => turnHtml(t, inHold(t.n), evidenceSet.has(t.n), isCall)).join("") || `<div class="empty">В диалоге пока нет реплик.</div>`}</div>
+        <div class="turns">${turns.map((t) => segmentHtml(t.n, holdRanges, recordingGaps) + turnHtml(t, inHold(t.n), evidenceSet.has(t.n), isCall)).join("") || `<div class="empty">В диалоге пока нет реплик.</div>`}</div>
       </section>
       <section class="stack" id="evalCol">
         ${ok ? evaluationHtml(ev, finalScore, finalRows, appealsByCrit) : ev && ev.status === "error"
@@ -69,8 +71,17 @@ export async function renderDialog(root, params = [], query = null, alive = () =
     el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
     setTimeout(() => el.classList.remove("flash"), 2000);
     const t = turns.find((x) => x.n === n);
-    if (player && t && t.rel_sec !== null && t.rel_sec !== undefined) {
-      try { player.currentTime = Math.max(0, t.rel_sec - 1); player.play().catch(() => {}); } catch { /* запись недоступна */ }
+    if (player && t && t.rel_sec !== null && t.rel_sec !== undefined && Number.isFinite(Number(t.rel_sec))) {
+      const seek = () => {
+        if (!isCurrent() || player.error) return;
+        try { player.currentTime = Math.max(0, Number(t.rel_sec)); }
+        catch { /* запись недоступна; текст остаётся доступным */ }
+      };
+      if (player.readyState >= 1) seek();
+      else {
+        player.onloadedmetadata = seek;
+        player.load();
+      }
     }
   };
   root.querySelectorAll("[data-ev]").forEach((b) => b.addEventListener("click", () => jump(Number(b.dataset.ev))));
@@ -153,6 +164,27 @@ function trackJob(cid, start) {
     });
   })();
   return task;
+}
+
+function safeAudioUrl(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const url = new URL(raw, location.href);
+    return ["http:", "https:"].includes(url.protocol) ? url.href : null;
+  } catch { return null; }
+}
+
+function segmentHtml(n, holds, gaps) {
+  const labels = [];
+  for (const [start, end] of holds) {
+    if (n === start) labels.push("Начало удержания · внутренняя консультация");
+    if (n === end) labels.push("Конец удержания");
+  }
+  for (const [start, end] of gaps) {
+    if (n === start) labels.push(end == null ? "Пауза записи · возобновление не отмечено" : "Начало паузы записи");
+    if (n === end) labels.push("Запись возобновлена");
+  }
+  return labels.map((label) => `<div class="segment-sep">${esc(label)}</div>`).join("");
 }
 
 function turnHtml(t, hold, isEvidence, isCall) {
@@ -238,6 +270,7 @@ function factsHtml(f) {
   if (f.operator_closed_turn) items.push(`Оператор закрыл чат: [${f.operator_closed_turn}].`);
   if (f.client_left_turn) items.push(`Клиент ушёл / связь прервалась: [${f.client_left_turn}].`);
   for (const [a, b] of f.hold_ranges || []) items.push(`Удержание клиента между [${a}] и [${b}].`);
+  for (const [a, b] of f.recording_gaps || []) items.push(b == null ? `Пауза записи с [${a}], возобновление не отмечено.` : `Пауза записи между [${a}] и [${b}].`);
   return `<details class="card card-pad facts"><summary>Факты, посчитанные кодом (без модели)</summary><ul class="facts-list">${items.map((x) => `<li>${x}</li>`).join("")}</ul></details>`;
 }
 
