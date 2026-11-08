@@ -5,18 +5,21 @@ import { errorToast, esc, fmtScore, jobBox, pollJob, state, toast } from "../ui.
 let draft = null;       // редактируемая копия
 let baseId = null;      // id версии, от которой редактируем
 let lastApply = null;   // {from, to, group}
+let renderSeq = 0;
+let applyRun = null;
+let paintApply = null;
 
 const TYPE_LABEL = { binary: "Да / Нет", scale: "Шкала", flag: "Грубая ошибка (флаг)" };
 
 function clean(cl) {
-  const out = JSON.parse(JSON.stringify(cl));
-  for (const k of Object.keys(out)) if (k.startsWith("_")) delete out[k];
-  return out;
+  return JSON.parse(JSON.stringify(cl, (key, value) => key.startsWith("_") ? undefined : value));
 }
 
-export async function renderChecklist(root, params, query, alive) {
+export async function renderChecklist(root, params = [], query = null, alive = () => true) {
+  const seq = ++renderSeq;
+  const current = () => alive() && seq === renderSeq;
   const [versions, active, groups] = await Promise.all([api.get("/api/checklists"), api.get("/api/checklists/active"), api.get("/api/groups")]);
-  if (!alive()) return;
+  if (!current()) return;
   if (!draft || baseId === null || !versions.some((v) => v.id === baseId)) { draft = clean(active); baseId = active._id; }
   const base = versions.find((v) => v.id === baseId) || versions[0];
 
@@ -56,15 +59,28 @@ export async function renderChecklist(root, params, query, alive) {
 
   const errorsBox = root.querySelector("[data-errors]");
   const sumEl = root.querySelector("[data-sum]");
+  const saveButton = root.querySelector('[data-act="save"]');
   let vTimer = null;
+  let validationSeq = 0;
+  let saving = false;
   const validate = () => {
     clearTimeout(vTimer);
+    const revision = ++validationSeq;
+    saveButton.disabled = true;
+    errorsBox.innerHTML = `<div class="muted small">Проверяем конфигурацию…</div>`;
     vTimer = setTimeout(async () => {
+      if (!current()) return;
       try {
         const res = await api.post("/api/checklists/validate", { data: draft });
+        if (!current() || revision !== validationSeq) return;
         sumEl.textContent = fmtScore(res.weights_sum);
+        saveButton.disabled = saving || res.errors.length > 0;
         errorsBox.innerHTML = res.errors.length ? `<div class="errors">${res.errors.map(esc).join("<br>")}</div>` : `<div class="okbox">Конфигурация корректна</div>`;
-      } catch (e) { errorsBox.innerHTML = `<div class="errors">${esc(e.message)}</div>`; }
+      } catch (e) {
+        if (!current() || revision !== validationSeq) return;
+        errorsBox.innerHTML = `<div class="errors">${esc(e.message)}</div>`;
+        errorToast(e);
+      }
     }, 250);
   };
 
@@ -81,9 +97,21 @@ export async function renderChecklist(root, params, query, alive) {
       <input type="text" value="${esc(s.id)}" data-sec-id="${i}" style="width:140px" placeholder="id">
       <input type="text" value="${esc(s.name)}" data-sec-name="${i}" style="flex:1" placeholder="Название секции">
       <button class="btn small danger" data-sec-del="${i}">✕</button></div>`).join("");
-    box.querySelectorAll("[data-sec-id]").forEach((el) => el.addEventListener("input", () => { draft.sections[+el.dataset.secId].id = el.value.trim(); validate(); }));
-    box.querySelectorAll("[data-sec-name]").forEach((el) => el.addEventListener("input", () => { draft.sections[+el.dataset.secName].name = el.value; }));
-    box.querySelectorAll("[data-sec-del]").forEach((el) => el.addEventListener("click", () => { draft.sections.splice(+el.dataset.secDel, 1); renderSections(); renderCriteria(); validate(); }));
+    box.querySelectorAll("[data-sec-id]").forEach((el) => el.addEventListener("input", () => {
+      const section = draft.sections[+el.dataset.secId];
+      const oldId = section.id;
+      section.id = el.value.trim();
+      draft.criteria.forEach((c) => { if (c.section === oldId) c.section = section.id; });
+      renderCriteria(); validate();
+    }));
+    box.querySelectorAll("[data-sec-name]").forEach((el) => el.addEventListener("input", () => {
+      draft.sections[+el.dataset.secName].name = el.value; renderCriteria(); validate();
+    }));
+    box.querySelectorAll("[data-sec-del]").forEach((el) => el.addEventListener("click", () => {
+      const [removed] = draft.sections.splice(+el.dataset.secDel, 1);
+      draft.criteria.forEach((c) => { if (c.section === removed.id) c.section = null; });
+      renderSections(); renderCriteria(); validate();
+    }));
   };
 
   const renderCriteria = () => {
@@ -97,7 +125,7 @@ export async function renderChecklist(root, params, query, alive) {
         <label class="field"><span>id (латиница)</span><input type="text" data-k="id" value="${esc(c.id)}"></label>
         <label class="field"><span>Название</span><input type="text" data-k="name" value="${esc(c.name)}"></label>
         <label class="field"><span>Тип ответа</span><select data-k="type">${Object.entries(TYPE_LABEL).map(([v, l]) => `<option value="${v}" ${c.type === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
-        <label class="field"><span>Вес</span><input type="number" min="0" step="1" data-k="weight" value="${c.type === "flag" ? 0 : esc(c.weight)}" ${c.type === "flag" ? "disabled" : ""}></label>
+        <label class="field ${c.type === "flag" ? "hidden" : ""}"><span>Вес</span><input type="number" min="0" step="1" data-k="weight" value="${c.type === "flag" ? 0 : esc(c.weight)}" ${c.type === "flag" ? "disabled" : ""}></label>
       </div>
       <div class="grid3">
         <label class="field"><span>Секция</span><select data-k="section">${secOpts(c.section)}</select></label>
@@ -132,15 +160,15 @@ export async function renderChecklist(root, params, query, alive) {
         });
       });
       card.querySelectorAll("[data-sv]").forEach((el) => el.addEventListener("input", () => { c.scale[+el.dataset.sv].value = Number(el.value); validate(); }));
-      card.querySelectorAll("[data-sl]").forEach((el) => el.addEventListener("input", () => { c.scale[+el.dataset.sl].label = el.value; }));
+      card.querySelectorAll("[data-sl]").forEach((el) => el.addEventListener("input", () => { c.scale[+el.dataset.sl].label = el.value; validate(); }));
       card.querySelectorAll("[data-sdel]").forEach((el) => el.addEventListener("click", () => { c.scale.splice(+el.dataset.sdel, 1); renderCriteria(); validate(); }));
       const sadd = card.querySelector("[data-sadd]");
-      if (sadd) sadd.addEventListener("click", () => { c.scale.push({ value: 0, label: "" }); renderCriteria(); });
+      if (sadd) sadd.addEventListener("click", () => { c.scale.push({ value: 0, label: "" }); renderCriteria(); validate(); });
       card.querySelector("[data-del]").addEventListener("click", () => { if (confirm(`Удалить критерий «${c.name}»?`)) { draft.criteria.splice(i, 1); renderCriteria(); validate(); } });
       const up = card.querySelector("[data-up]");
       const down = card.querySelector("[data-down]");
-      up.addEventListener("click", () => { [draft.criteria[i - 1], draft.criteria[i]] = [draft.criteria[i], draft.criteria[i - 1]]; renderCriteria(); });
-      down.addEventListener("click", () => { [draft.criteria[i + 1], draft.criteria[i]] = [draft.criteria[i], draft.criteria[i + 1]]; renderCriteria(); });
+      up.addEventListener("click", () => { [draft.criteria[i - 1], draft.criteria[i]] = [draft.criteria[i], draft.criteria[i - 1]]; renderCriteria(); validate(); });
+      down.addEventListener("click", () => { [draft.criteria[i + 1], draft.criteria[i]] = [draft.criteria[i], draft.criteria[i + 1]]; renderCriteria(); validate(); });
     });
   };
 
@@ -153,55 +181,90 @@ export async function renderChecklist(root, params, query, alive) {
     root.querySelector(`.crit-edit[data-i="${draft.criteria.length - 1}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" });
   });
 
-  root.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", async () => {
-    const cl = await api.get(`/api/checklists/${b.dataset.open}`);
-    draft = clean(cl); baseId = cl._id; renderChecklist(root, params, query, alive);
-  }));
-  root.querySelectorAll("[data-activate]").forEach((b) => b.addEventListener("click", async () => {
-    try { await api.post(`/api/checklists/${b.dataset.activate}/activate`); toast("Версия активирована", "ok"); renderChecklist(root, params, query, alive); } catch (e) { errorToast(e); }
-  }));
+  let switching = false;
+  const selectVersion = async (button, activate) => {
+    if (switching || saving || !current()) return;
+    switching = true;
+    root.querySelectorAll("[data-open], [data-activate]").forEach((b) => { b.disabled = true; });
+    try {
+      const cl = activate
+        ? await api.post(`/api/checklists/${button.dataset.activate}/activate`)
+        : await api.get(`/api/checklists/${button.dataset.open}`);
+      if (!current()) return;
+      draft = clean(cl); baseId = cl._id;
+      if (activate) toast("Версия активирована", "ok");
+      await renderChecklist(root, params, query, alive);
+    } catch (error) { if (alive()) errorToast(error); }
+    finally {
+      switching = false;
+      if (current()) root.querySelectorAll("[data-open], [data-activate]").forEach((b) => { b.disabled = false; });
+    }
+  };
+  root.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => selectVersion(b, false)));
+  root.querySelectorAll("[data-activate]").forEach((b) => b.addEventListener("click", () => selectVersion(b, true)));
 
   root.querySelector('[data-act="save"]').addEventListener("click", async (e) => {
+    if (saving || switching || !current()) return;
+    saving = true;
     e.target.disabled = true;
     try {
-      const fromId = (versions.find((v) => v.active) || {}).id;
-      const saved = await api.post("/api/checklists", { data: draft, note: root.querySelector("[data-note]").value.trim() || "Изменение через интерфейс", activate: true });
+      const fromId = baseId;
+      const saved = await api.post("/api/checklists", { data: clean(draft), note: root.querySelector("[data-note]").value.trim() || "Изменение через интерфейс", activate: true });
+      if (!current()) return;
       toast(`Сохранена версия v${saved.version}`, "ok");
       draft = clean(saved); baseId = saved._id;
       lastApply = { from: fromId, to: saved._id, version: saved.version };
       state.lastChecklistId = saved._id;
       await renderChecklist(root, params, query, alive);
-    } catch (err) { errorToast(err); e.target.disabled = false; }
+    } catch (err) { if (alive()) { errorToast(err); e.target.disabled = false; } }
+    finally { saving = false; }
   });
 
-  renderApply(root, groups);
+  renderApply(root, groups, current);
   renderSections();
   renderCriteria();
   validate();
 }
 
-function renderApply(root, groups) {
+function renderApply(root, groups, current) {
   const area = root.querySelector("#applyArea");
   if (!lastApply) { area.innerHTML = ""; return; }
   area.innerHTML = `<div class="card card-pad stack">
     <div class="row"><b>Применить версию v${lastApply.version} к диалогам</b>
       <span class="muted small">Неизменённые критерии переиспользуются, смена веса пересчитывается без модели — перегоняются только изменённые формулировки.</span></div>
     <div class="row">
-      <select data-ag>${groups.map((g) => `<option value="${esc(g.group_id)}">${esc(g.group_id)} (${g.count})</option>`).join("")}</select>
-      <select data-av><option value="1">1 голос</option><option value="3">3 голоса</option></select>
+      <select data-ag aria-label="Группа для применения"><option value="">Все группы</option>${groups.map((g) => `<option value="${esc(g.group_id)}">${esc(g.group_id)} (${g.count})</option>`).join("")}</select>
+      <select data-av aria-label="Число голосов"><option value="1">1 голос</option><option value="3">3 голоса</option></select>
       <button class="btn primary" data-apply>Применить</button>
     </div>
     <div data-ajob></div><div data-diff></div></div>`;
-  area.querySelector("[data-apply]").addEventListener("click", async (e) => {
+  const target = { ...lastApply };
+  paintApply = () => {
+    if (!current()) return;
+    area.querySelectorAll("[data-apply], [data-ag], [data-av]").forEach((el) => { el.disabled = !!applyRun?.running || !groups.length; });
+    if (applyRun?.to !== target.to) return;
+    if (applyRun.job) area.querySelector("[data-ajob]").innerHTML = jobBox(applyRun.job, `Применение v${target.version}`);
+    if (applyRun.diff) area.querySelector("[data-diff]").innerHTML = diffHtml(applyRun.diff);
+  };
+  if (applyRun?.to === target.to) area.querySelector("[data-ag]").value = applyRun.group;
+  paintApply();
+  area.querySelector("[data-apply]").addEventListener("click", async () => {
+    if (applyRun?.running || !current()) return;
     const group = area.querySelector("[data-ag]").value;
-    e.target.disabled = true;
+    const votes = Number(area.querySelector("[data-av]").value);
+    const run = applyRun = { ...target, group, running: true, job: null, diff: null };
+    area.querySelector("[data-diff]").innerHTML = "";
+    paintApply();
     try {
-      const { job_id } = await api.post("/api/evaluate", { group_id: group, checklist_id: lastApply.to, votes: Number(area.querySelector("[data-av]").value) });
-      const job = await pollJob(job_id, (j) => { area.querySelector("[data-ajob]").innerHTML = jobBox(j, `Применение v${lastApply.version}`); });
-      toast(`Готово: ${job.done} диалогов, вызовов модели ${job.llm_calls}`, "ok");
-      const diff = lastApply.from ? await api.get("/api/diff" + qs({ group_id: group, from_checklist: lastApply.from, to_checklist: lastApply.to })) : [];
-      area.querySelector("[data-diff]").innerHTML = diffHtml(diff);
-    } catch (err) { errorToast(err); } finally { e.target.disabled = false; }
+      const { job_id } = await api.post("/api/evaluate", { group_id: group, checklist_id: target.to, votes });
+      const job = await pollJob(job_id, (j) => { run.job = j; paintApply?.(); });
+      if (job.status === "failed") throw new Error(job.error || "Не удалось применить чек-лист");
+      const errors = (job.results || []).filter((r) => r.status !== "ok");
+      if (errors.length) toast(`Применение завершено с ошибками: ${errors.length}. ${errors[0].error || ""}`, "error");
+      else toast(`Готово: ${job.done} диалогов, вызовов модели ${job.llm_calls}`, "ok");
+      run.diff = target.from ? await api.get("/api/diff" + qs({ group_id: group, from_checklist: target.from, to_checklist: target.to })) : [];
+    } catch (err) { errorToast(err); }
+    finally { run.running = false; paintApply?.(); }
   });
 }
 
@@ -212,6 +275,8 @@ function diffHtml(diff) {
   return `<h3 style="margin-top:8px">Что изменилось: ${changed.length} из ${diff.length} диалогов</h3>
     <table class="grid small"><tr><th>Диалог</th><th>Итог до</th><th>Итог после</th><th>Изменённые критерии</th></tr>
     ${diff.map((d) => `<tr><td><a class="mono" href="#/dialog/${encodeURIComponent(d.conversation_id)}">${esc(d.conversation_id)}</a></td>
-      <td>${fmtScore(d.before)}</td><td><b>${fmtScore(d.after)}</b>${d.after !== d.before ? ` <span class="${d.after > d.before ? "pill yes" : "pill no"}">${d.after > d.before ? "+" : ""}${fmtScore(Math.round((d.after - d.before) * 100) / 100)}</span>` : ""}</td>
+      <td>${fmtScore(d.before)}</td><td><b>${fmtScore(d.after)}</b>${d.after != null && d.before != null && d.after !== d.before ? ` <span class="${d.after > d.before ? "pill yes" : "pill no"}">${d.after > d.before ? "+" : ""}${fmtScore(Math.round((d.after - d.before) * 100) / 100)}</span>` : ""}</td>
       <td>${d.changed.map((c) => `${esc(c.criterion_id)}: ${esc(c.before)} → ${esc(c.after)}`).join("; ") || "—"}</td></tr>`).join("")}</table>`;
 }
+
+export { renderChecklist as render };

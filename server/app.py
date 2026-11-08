@@ -629,7 +629,7 @@ def diff(group_id: Optional[str] = None, from_checklist: Optional[int] = None, t
         rows_a = {r["criterion_id"]: r for r in a["criteria"]}
         for r in b["criteria"]:
             ra = rows_a.get(r["criterion_id"])
-            if not ra or ra.get("value") != r.get("value"):
+            if not ra or any(ra.get(k) != r.get(k) for k in ("value", "def_hash", "weight", "type", "name")):
                 changed.append({"criterion_id": r["criterion_id"], "before": ra.get("value_label") if ra else "—",
                                 "after": r.get("value_label")})
         for cid_a in rows_a:
