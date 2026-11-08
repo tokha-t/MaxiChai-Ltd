@@ -381,8 +381,8 @@ def evaluate(body: Dict[str, Any] = Body(...)):
     reuse=true — переиспользовать неизменённые критерии прошлой оценки (смена веса — без вызова модели);
     force=["contact"] — перегнать эти критерии в любом случае."""
     ids = body.get("conversation_ids") or []
-    if body.get("group_id") and not ids:
-        ids = [c["conversation_id"] for c in store.list_conversations(body["group_id"])]
+    if "group_id" in body and not ids:
+        ids = [c["conversation_id"] for c in store.list_conversations(body["group_id"] or None)]
     if not ids:
         _err(400, "Нечего оценивать: передайте conversation_ids или group_id")
     convs = [store.get_conversation(i) for i in ids]
