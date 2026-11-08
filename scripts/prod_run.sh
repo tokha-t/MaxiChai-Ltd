@@ -6,7 +6,7 @@
 set -euo pipefail
 GROUP="${1:?Укажите group_id контрольного набора}"
 shift || true
-[ -f .venv/bin/activate ] && source .venv/bin/activate
+[ -x .venv/bin/python ] && source .venv/bin/activate
 python -m cqa evaluate --group "$GROUP" --refresh --out results/prod/results.json --expect 10 "$@"
 python -m cqa validate results/prod/results.json --group "$GROUP" --expect 10
 git add results/prod/results.json runs/

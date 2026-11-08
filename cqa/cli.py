@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .checklist import ensure_defaults, load_default, load_file, validate_checklist
-from .config import _judge, settings
+from .config import _judge, settings, with_judges
 from .dataset import get_group, records_from_upload, save_cache
 from .evaluator import evaluate_many
 from .export import build_results, write_results
@@ -69,10 +69,14 @@ def cmd_evaluate(args) -> None:
     store = Store()
     store.upsert_conversations(records, args.group)
     checklist = _pick_checklist(args.checklist, store)
-    client = make_client()
+    cfg = with_judges(settings, args.judges) if args.judges else settings
+    client = make_client(cfg)
     total = len(records)
     print(f"Оцениваю {total} диалогов: судьи {client.model}; голосов {args.votes or settings.llm_votes}; "
           f"режим {settings.llm_mode}; чек-лист «{checklist.get('name')}» v{checklist.get('version')}")
+    dead = [j.model for j in client.judges if getattr(j, "dead_reason", None)]
+    if dead:
+        print("Пропущены судьи:", ", ".join(dead))
     started = time.time()
     done = {"n": 0, "cost": 0.0}
     settings.runs_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +115,9 @@ def cmd_evaluate(args) -> None:
     print(f"Готово: {ok}/{total} без ошибок за {elapsed:.0f} с, стоимость ≈ ${done['cost']:.3f} "
           f"(≈ ${done['cost'] / max(1, total):.4f} за диалог). Журнал: {log_path}")
     if args.out:
-        doc = build_results(results, [r["conversation_id"] for r in records], model_name=client.model, mode=settings.model_mode)
+        used = sorted({v.get("model") for r in results if r.get("status") == "ok" for c in r["criteria"] for v in c.get("votes") or [] if v.get("model")})
+        doc = build_results(results, [r["conversation_id"] for r in records],
+                            model_name=" + ".join(used) if used else client.model, mode=cfg.model_mode)
         path = write_results(doc, args.out)
         print(f"results.json → {path}")
         turn_counts = {r["conversation_id"]: len(r["transcript"]) for r in records}
@@ -158,17 +164,68 @@ def cmd_show(args) -> None:
         print(f"      {r['rationale']}  реплики {r['evidence_turns']}")
 
 
+SECRET_KEYS = ("ORG_API_URL", "GEMINI_API_KEY", "CEREBRAS_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY",
+               "MISTRAL_API_KEY", "GITHUB_TOKEN", "OPENAI_API_KEY", "TEAM_NAME")
+
+
+def _read_env(path: Path) -> Dict[str, str]:
+    from .config import _clean_value
+    out: Dict[str, str] = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.split("=", 1)
+                out[k.strip()] = _clean_value(v)
+    return out
+
+
+def cmd_setup(args) -> None:
+    """Собирает .env из свежего шаблона: спрашивает только ссылку организаторов и ключ Gemini."""
+    import getpass
+    from .config import ROOT
+    env_path = ROOT / ".env"
+    template = (ROOT / ".env.example").read_text(encoding="utf-8")
+    old = _read_env(env_path)
+    keep = {k: v for k, v in old.items() if k in SECRET_KEYS and v and "..." not in v}
+    if args.force or not keep.get("ORG_API_URL"):
+        url = input("Вставьте ссылку API организаторов (из гайда) и нажмите Enter: ").strip().strip('"').strip("'")
+        if url:
+            keep["ORG_API_URL"] = url
+    first_time = args.force or not keep.get("GEMINI_API_KEY")
+    if first_time:
+        key = getpass.getpass("Вставьте ключ Gemini (символы не отображаются — это нормально) и нажмите Enter: ").strip()
+        if key:
+            keep["GEMINI_API_KEY"] = key
+        key = getpass.getpass("Ключ Cerebras — необязательно, просто Enter чтобы пропустить: ").strip()
+        if key:
+            keep["CEREBRAS_API_KEY"] = key
+    lines = []
+    for line in template.splitlines():
+        k = line.split("=", 1)[0].strip() if "=" in line and not line.startswith("#") else None
+        if k and k in keep:
+            line = f"{k}={keep[k]}"
+        lines.append(line)
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        env_path.chmod(0o600)
+    except OSError:
+        pass
+    missing = [k for k in ("ORG_API_URL", "GEMINI_API_KEY") if not keep.get(k)]
+    print(".env готов." + (f" Не заполнено: {', '.join(missing)}" if missing else ""))
+
+
 def cmd_judges(args) -> None:
-    print(f"Режим: {settings.llm_mode} (batch — все критерии одним вызовом), голосов: {settings.llm_votes}, "
-          f"mode для results.json: {settings.model_mode}")
-    for j in settings.judges:
+    cfg = with_judges(settings, args.judges) if getattr(args, "judges", None) else settings
+    print(f"Режим: {cfg.llm_mode} (batch — все критерии одним вызовом), голосов: {cfg.llm_votes}, "
+          f"mode для results.json: {cfg.model_mode}")
+    for j in cfg.judges:
         key = "ключ есть" if j.api_key else ("ключ не нужен" if j.local else "НЕТ КЛЮЧА")
         kind = "локальная" if j.local else ("бесплатный тариф" if j.free else "платная")
         print(f"  {j.label:<45} {kind:<17} {key:<14} rpm={j.rpm or '∞'} параллельно={j.concurrency}  {j.base_url}")
 
 
 def cmd_ping(args) -> None:
-    panel = make_client()
+    panel = make_client(with_judges(settings, args.judges) if args.judges else settings)
     msgs = [{"role": "system", "content": "Отвечай строго JSON-объектом."},
             {"role": "user", "content": 'Верни {"ok": true, "answer": "<одно слово по-казахски: спасибо>"}'}]
     bad = 0
@@ -218,6 +275,7 @@ def main(argv=None) -> None:
     e.add_argument("--url", help="другая ссылка API (без group_id), если организаторы дали новую")
     e.add_argument("--file", help="набор из локального JSON-файла вместо API")
     e.add_argument("--no-db", action="store_true", help="не сохранять оценки в базу")
+    e.add_argument("--judges", help="судьи на этот прогон вместо LLM_JUDGES, например gemini:gemini-3.6-flash,cerebras:gpt-oss-120b")
     e.set_defaults(func=cmd_evaluate)
 
     v = sub.add_parser("validate", help="проверить results.json")
@@ -226,10 +284,16 @@ def main(argv=None) -> None:
     v.add_argument("--expect", type=int)
     v.set_defaults(func=cmd_validate)
 
+    st = sub.add_parser("setup", help="собрать .env: спросит ссылку организаторов и ключ Gemini")
+    st.add_argument("--force", action="store_true", help="спросить заново, даже если уже заполнено")
+    st.set_defaults(func=cmd_setup)
+
     j = sub.add_parser("judges", help="какие модели-судьи настроены")
+    j.add_argument("--judges")
     j.set_defaults(func=cmd_judges)
 
-    pg = sub.add_parser("ping", help="проверить, что каждый судья отвечает")
+    pg = sub.add_parser("ping", help="проверить, что каждый судья отвечает (1 запрос на модель)")
+    pg.add_argument("--judges")
     pg.set_defaults(func=cmd_ping)
 
     md = sub.add_parser("models", help="список моделей провайдера (точные имена для LLM_JUDGES)")

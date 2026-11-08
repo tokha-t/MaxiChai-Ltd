@@ -2,7 +2,7 @@
 import { api } from "../api.js";
 import { errorToast, esc, toast } from "../ui.js";
 
-export async function renderSettings(root, params, query, alive) {
+export async function renderSettings(root, params = [], query = null, alive = () => true) {
   const s = await api.get("/api/settings");
   if (!alive()) return;
   root.innerHTML = `
@@ -56,3 +56,5 @@ export async function renderSettings(root, params, query, alive) {
     } catch (err) { errorToast(err); } finally { e.target.disabled = false; }
   });
 }
+
+export { renderSettings as render };

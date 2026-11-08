@@ -244,6 +244,8 @@ def facts_to_text(facts: Dict[str, Any]) -> str:
         lines.append(f"- Оператор закрыл чат: реплика {facts['operator_closed_turn']}.")
     if facts.get("client_left_turn"):
         lines.append(f"- Клиент ушёл / связь прервалась / клиент завершил разговор: реплика {facts['client_left_turn']}.")
+    else:
+        lines.append("- Системного события об уходе клиента или обрыве связи нет: у оператора была возможность завершить диалог.")
     if facts.get("last_operator_turn"):
         tail = "после неё клиент больше не писал" if facts.get("operator_after_last_client") else "после неё были сообщения клиента без ответа оператора"
         lines.append(f"- Последняя реплика оператора: {facts['last_operator_turn']} ({tail}). Последняя реплика диалога — {facts.get('last_turn_speaker')}.")

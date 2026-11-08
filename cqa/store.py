@@ -63,6 +63,14 @@ CREATE TABLE IF NOT EXISTS appeals (
 """
 
 _lock = threading.RLock()
+DEFAULT_NOTE = "Исходный чек-лист организаторов"
+
+
+def _fingerprint(cl: Dict[str, Any]) -> str:
+    from .checklist import criterion_hash
+    cl = ensure_defaults(cl)
+    parts = [f"{c['id']}:{criterion_hash(c, cl)}:{c.get('weight')}:{c.get('section')}" for c in cl.get("criteria", [])]
+    return "|".join(parts)
 
 
 def _now() -> str:
@@ -70,16 +78,31 @@ def _now() -> str:
 
 
 class Store:
+    """Своё соединение SQLite на каждый поток: сервер обслуживает запросы и фоновые оценки параллельно."""
+
     def __init__(self, path: Optional[Path] = None):
         self.path = Path(path or settings.db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self._local = threading.local()
         with _lock:
             self.conn.executescript(SCHEMA)
             self.conn.commit()
-        if self.active_checklist() is None:
-            self.save_checklist(load_default(), note="Исходный чек-лист организаторов", activate=True)
+        active = self.active_checklist()
+        if active is None:
+            self.save_checklist(load_default(), note=DEFAULT_NOTE, activate=True)
+        elif (active.get("_note") or "").startswith(DEFAULT_NOTE) and _fingerprint(active) != _fingerprint(load_default()):
+            # активен нетронутый исходный чек-лист, а в config/ подсказки уточнены — подхватываем новой версией
+            self.save_checklist(load_default(), note=DEFAULT_NOTE + " (уточнены подсказки для ИИ)", activate=True)
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._local.conn = conn
+        return conn
 
     # ---------- диалоги ----------
     def upsert_conversations(self, records: List[Dict[str, Any]], group_id: str) -> int:

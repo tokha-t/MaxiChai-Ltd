@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -19,9 +20,19 @@ def _load_dotenv(path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        value = _clean_value(value)
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+def _clean_value(value: str) -> str:
+    """Убирает кавычки и комментарий в конце строки: LLM_VOTES=3   # голосов → 3."""
+    value = value.strip()
+    if value[:1] in ("'", '"'):
+        quote = value[0]
+        end = value.find(quote, 1)
+        return value[1:end] if end != -1 else value[1:]
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
 
 
 _load_dotenv(ROOT / ".env")
@@ -58,7 +69,7 @@ def _env_int(name: str, default: int) -> int:
 # rpm — темп запросов по умолчанию (бесплатные тарифы режут частоту), local — модель на своём компьютере.
 PROVIDERS = {
     "openai": {"base": "https://api.openai.com/v1", "keys": ["OPENAI_API_KEY", "LLM_API_KEY"], "rpm": 0, "free": False, "local": False},
-    "gemini": {"base": "https://generativelanguage.googleapis.com/v1beta/openai", "keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY"], "rpm": 10, "free": True, "local": False},
+    "gemini": {"base": "https://generativelanguage.googleapis.com/v1beta/openai", "keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY"], "rpm": 5, "free": True, "local": False},
     "cerebras": {"base": "https://api.cerebras.ai/v1", "keys": ["CEREBRAS_API_KEY"], "rpm": 5, "free": True, "local": False},
     "groq": {"base": "https://api.groq.com/openai/v1", "keys": ["GROQ_API_KEY"], "rpm": 30, "free": True, "local": False},
     "openrouter": {"base": "https://openrouter.ai/api/v1", "keys": ["OPENROUTER_API_KEY"], "rpm": 20, "free": True, "local": False},
@@ -164,21 +175,32 @@ def parse_judges(spec: Optional[str], fallback_provider: str, fallback_model: st
     return judges
 
 
+def mode_for(judges: List[JudgeSpec]) -> str:
+    if all(j.local for j in judges):
+        return "local"
+    if any(j.local for j in judges):
+        return "hybrid"
+    return "external_api"
+
+
+def with_judges(cfg: "Settings", spec: str) -> "Settings":
+    """Копия настроек с другим набором судей (флаг --judges у CLI)."""
+    import dataclasses
+    judges = parse_judges(spec, cfg.llm_provider, "", cfg.llm_concurrency)
+    return dataclasses.replace(cfg, judges=judges, llm_model=" + ".join(j.label for j in judges),
+                               model_mode=_env("MODEL_MODE") or mode_for(judges))
+
+
 def load_settings() -> Settings:
     data_dir = Path(_env("CQA_DATA_DIR", str(ROOT / "data")))
     max_tokens_raw = _env("LLM_MAX_TOKENS")
     provider = (_env("LLM_PROVIDER", "gemini") or "gemini").lower()
-    model = _env("LLM_MODEL", "gemini-3.6-flash") or "gemini-3.6-flash"
+    model = _env("LLM_MODEL", "gemini-3.5-flash-lite") or "gemini-3.5-flash-lite"
     concurrency = max(1, _env_int("LLM_CONCURRENCY", 8))
     judges = parse_judges(_env("LLM_JUDGES"), provider, model, concurrency)
     if provider == "mock":
         judges = [_judge("mock", "mock", concurrency)]
-    if all(j.local for j in judges):
-        default_mode = "local"
-    elif any(j.local for j in judges):
-        default_mode = "hybrid"
-    else:
-        default_mode = "external_api"
+    default_mode = mode_for(judges)
     return Settings(
         org_api_url=_env("ORG_API_URL"),
         llm_provider=provider,

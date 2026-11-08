@@ -47,7 +47,7 @@ export async function renderChecklist(root, params = [], query = null, alive = (
         <div class="card card-pad stack">
           <div class="row">
             <label class="field" style="flex:1"><span>Название чек-листа</span><input type="text" data-top="name"></label>
-            <label class="field"><span>Порог первой реакции, сек</span><input type="number" min="0" data-top="first_response_threshold_sec" style="width:120px"></label>
+            <label class="field"><span>Порог первой реакции, сек</span><input type="number" min="1" step="1" data-top="first_response_threshold_sec" style="width:120px"></label>
           </div>
           <label class="field"><span>Общие правила (передаются модели)</span><textarea rows="2" data-top="notes"></textarea></label>
           <div><span class="muted small">Секции</span><div data-sections></div><button class="btn small" data-act="add-section">＋ секция</button></div>

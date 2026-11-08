@@ -230,6 +230,7 @@ audio { width: 100%; }
 .dialog-layout > *, .cl-layout > *, .appeal-grid > *, .turn > * { min-width: 0; }
 .grid td, .reason, .rationale, .quote, .kv dd, .page-head h1 { overflow-wrap: anywhere; }
 .grid .score { font-size: 20px; }
+[data-act="eval-selected"] { min-width: 220px; justify-content: center; }
 .crit-edit .grid2 { grid-template-columns: minmax(100px,160px) minmax(100px,1fr) minmax(130px,170px) minmax(70px,120px); }
 .score-big.hi { color: var(--accent-dark); }
 .score-big.mid { color: var(--warn); }

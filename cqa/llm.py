@@ -168,11 +168,21 @@ class OpenAICompatibleClient:
             if resp.status_code == 404:
                 self.dead_reason = "модель не найдена — проверьте имя: python -m cqa models --provider " + self.spec.provider
                 raise JudgeUnavailable(f"{self.model}: {self.dead_reason}")
+            if resp.status_code == 429 and re.search(r"per ?day|perday|requests_per_day|daily", low):
+                # дневная квота бесплатного тарифа — ретраи не помогут, выключаем судью до конца прогона
+                self.dead_reason = "дневной лимит бесплатного тарифа исчерпан (у Gemini сброс в полночь по Тихоокеанскому времени = 13:00 по Алматы)"
+                raise JudgeUnavailable(f"{self.model}: {self.dead_reason}")
             if resp.status_code in (408, 409, 429) or resp.status_code >= 500:
                 last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
                 attempt += 1
                 retry_after = resp.headers.get("retry-after")
-                wait = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else min(60, 5 * 2 ** attempt)
+                hint = re.search(r"retry in ([0-9.]+)\s*s", low)
+                if retry_after and retry_after.replace(".", "", 1).isdigit():
+                    wait = float(retry_after)
+                elif hint:
+                    wait = float(hint.group(1))
+                else:
+                    wait = min(60, 5 * 2 ** attempt)
                 time.sleep(min(90, wait + random.random()))
                 continue
             if resp.status_code >= 400:

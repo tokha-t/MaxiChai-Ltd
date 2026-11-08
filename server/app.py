@@ -318,16 +318,26 @@ def checklist_get(cl_id: int):
     return cl
 
 
+def _threshold_errors(data: Dict[str, Any]) -> List[str]:
+    threshold = data.get("first_response_threshold_sec", 180)
+    if type(threshold) is not int or threshold < 1:
+        return ["Порог первой реакции должен быть целым числом секунд больше нуля"]
+    return []
+
+
 @app.post("/api/checklists/validate")
 def checklist_validate(body: Dict[str, Any] = Body(...)):
     data = ensure_defaults(body.get("data") or body)
-    return {"errors": validate_checklist(data),
+    return {"errors": validate_checklist(data) + _threshold_errors(data),
             "weights_sum": sum(float(c.get("weight") or 0) for c in data.get("criteria", []) if c.get("type") != "flag")}
 
 
 @app.post("/api/checklists")
 def checklist_save(body: Dict[str, Any] = Body(...)):
     """{"data": {...чек-лист...}, "note": "что поменяли", "activate": true} → новая версия."""
+    errors = _threshold_errors(body.get("data") or {})
+    if errors:
+        _err(400, errors[0])
     try:
         return store.save_checklist(body.get("data") or {}, note=body.get("note") or "", activate=body.get("activate", True))
     except ValueError as exc:
