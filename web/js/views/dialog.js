@@ -69,6 +69,7 @@ export async function renderDialog(root, params = [], query = null, alive = () =
           <div class="row"><h2 id="dialog-transcript-title">Транскрипт</h2><span class="muted small">${turns.length} реплик</span></div>
           <button class="btn dialog-return" data-return-criterion hidden>Вернуться к критерию</button>
           ${isCall ? `<div class="call-context">${audioUrl ? `<audio controls preload="none" src="${esc(audioUrl)}" id="player" aria-label="Запись звонка"></audio>
+            <p class="small" id="audio-status" role="status" hidden></p>
             <div class="small muted">Клик по реплике перематывает запись. Если плеер не играет — <a href="${esc(audioUrl)}" target="_blank" rel="noopener">Открыть запись</a>.</div>` : `<div class="small muted">Запись недоступна.</div>`}
             <p class="small muted">Транскрипт звонка распознан автоматически; удержание и паузы записи отмечены.</p></div>` : ""}
         </div>
@@ -109,6 +110,21 @@ export async function renderDialog(root, params = [], query = null, alive = () =
   setPanel(activePanel);
 
   const player = root.querySelector("#player");
+  const audioStatus = root.querySelector("#audio-status");
+  const showAudioError = () => {
+    if (!isCurrent() || !audioStatus) return;
+    audioStatus.textContent = "Не удалось воспроизвести запись. Попробуйте открыть её по ссылке ниже. Транскрипт остаётся доступен.";
+    audioStatus.hidden = false;
+  };
+  if (player) {
+    player.addEventListener("error", showAudioError);
+    player.addEventListener("loadedmetadata", () => {
+      if (!isCurrent() || !audioStatus) return;
+      audioStatus.textContent = "";
+      audioStatus.hidden = true;
+    });
+    if (player.error) showAudioError();
+  }
   const returnButton = root.querySelector("[data-return-criterion]");
   const criterionNodes = new Map([...root.querySelectorAll("[data-criterion-id]")].map((node) => [node.dataset.criterionId, node]));
   let returnCriterion = null;

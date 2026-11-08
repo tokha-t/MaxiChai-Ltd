@@ -242,7 +242,7 @@ function evaluationPreview(scope) {
   const body = h(`<div class="stack"><p><b>Диалогов: ${scope.count}</b> · ${esc(scope.scope)}</p>
     <label class="field"><span>Режим оценки</span><select data-mode><option value="reuse">Переиспользовать подходящие сохранённые результаты</option><option value="new">Новый анализ всех критериев</option></select></label>
     <p class="small muted" data-mode-description>Сервер переиспользует подходящие ответы для неизменённых критериев и пересчитает итог. Новые или изменённые критерии потребуют проверки моделью.</p>
-    <label class="field"><span>Число проверок</span><select data-votes><option value="1">Одна проверка</option><option value="3">Три проверки</option></select></label>
+    <label class="field"><span>Число проверок</span><select data-votes><option value="3" selected>Три проверки</option><option value="1">Одна проверка</option></select></label>
     <p class="small muted">Несколько проверок помогают увидеть расхождения моделей и могут занять больше времени. Время и стоимость зависят от моделей, числа проверок и переиспользованных результатов.</p></div>`);
   body.querySelector("[data-mode]").addEventListener("change", (event) => { body.querySelector("[data-mode-description]").textContent = event.target.value === "new" ? "Будет выполнен новый анализ всех критериев. Сохранённые ответы не переиспользуются." : "Сервер переиспользует подходящие ответы для неизменённых критериев и пересчитает итог. Новые или изменённые критерии потребуют проверки моделью."; });
   modal({ title: "Запуск оценки", body, actions: [{ label: "Отмена" }, { label: `Начать оценку (${scope.count})`, kind: "primary", onClick: async () => {
@@ -424,10 +424,12 @@ function saveModal(groups, selectedGroup = "") {
         label: "Сохранить в проект", kind: "primary", onClick: async ({ body: b }) => {
           const res = await api.post("/api/results/save", { group_id: b.querySelector("[data-g]").value, target: b.querySelector("[data-t]").value });
           const out = b.querySelector("[data-out]");
-          out.innerHTML = res.errors.length
-            ? `<div class="errors"><b>Есть ошибки формата — файл не сохранён, прежний results.json не изменён:</b><br>${res.errors.map(esc).join("<br>")}</div>`
-            : `<div class="okbox">Сохранено: <b>${esc(res.path)}</b> — записей ${res.count}, оценено ${res.ok}${res.not_evaluated ? `, не оценено ${res.not_evaluated}` : ""}. Формат проверен.</div>`;
-          if (res.warnings.length) out.innerHTML += `<div class="muted small" style="margin-top:6px">${res.warnings.map(esc).join("<br>")}</div>`;
+          const errors = Array.isArray(res.errors) ? res.errors : [];
+          const warnings = Array.isArray(res.warnings) ? res.warnings : [];
+          out.innerHTML = res.saved === true
+            ? `<div class="okbox">Сохранено: <b>${esc(res.path)}</b> — записей ${res.count}, оценено ${res.ok}${res.not_evaluated ? `, не оценено ${res.not_evaluated}` : ""}. Формат проверен.</div>`
+            : `<div class="errors"><b>${res.saved === false ? "Файл НЕ сохранён. Прежний results.json не изменён." : "Сохранение файла не подтверждено сервером."}</b><br>${errors.length ? errors.map(esc).join("<br>") : "Сервер не сообщил причину. Повторите сохранение после проверки результатов."}</div>`;
+          if (warnings.length) out.innerHTML += `<div class="muted small" style="margin-top:6px">${warnings.map(esc).join("<br>")}</div>`;
           return true;
         },
       },
