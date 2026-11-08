@@ -246,9 +246,21 @@ def upload(body: Dict[str, Any] = Body(...)):
     return {"group_id": group, "count": len(records), "ids": [r["conversation_id"] for r in records]}
 
 
+def _criterion_failed(row: Dict[str, Any]) -> bool:
+    """Единое определение нарушения для списка диалогов и счётчиков дашборда."""
+    if row.get("value") is None:
+        return False
+    if row["type"] == "flag":
+        return row["value"] is True
+    return (row.get("points") or 0) < (row.get("max_points") or 0)
+
+
 @app.get("/api/conversations")
 def conversations(group_id: Optional[str] = None, language: Optional[str] = None, channel: Optional[str] = None,
-                  critical: Optional[bool] = None, needs_review: Optional[bool] = None, q: Optional[str] = None):
+                  critical: Optional[bool] = None, needs_review: Optional[bool] = None, q: Optional[str] = None,
+                  criterion_id: Optional[str] = None, criterion_violation: bool = False):
+    if criterion_violation and not criterion_id:
+        _err(400, "Для отбора нарушений укажите criterion_id")
     open_appeals = Counter(a["conversation_id"] for a in store.list_appeals(status="open"))
     rows = []
     for c in store.list_conversations(group_id):
@@ -259,6 +271,14 @@ def conversations(group_id: Optional[str] = None, language: Optional[str] = None
         if q and q.lower() not in c["conversation_id"].lower():
             continue
         ev = final_view(store.latest_evaluation(c["conversation_id"]))
+        if criterion_id:
+            if not ev or ev.get("status") != "ok":
+                continue
+            criterion = next((r for r in ev["final"]["criteria"] if r["criterion_id"] == criterion_id), None)
+            if criterion is None or criterion.get("value") is None:
+                continue
+            if criterion_violation and not _criterion_failed(criterion):
+                continue
         summary = None
         if ev:
             ok = ev.get("status") == "ok"
@@ -641,8 +661,8 @@ def stats(group_id: Optional[str] = None):
             s = per_crit[r["criterion_id"]]
             s["name"] = r["name"]
             s["n"] += 1
+            s["fail"] += int(_criterion_failed(r))
             if r["type"] == "flag":
-                s["fail"] += 1 if r["value"] is True else 0
                 continue
             if r["value"] is None:
                 s["na"] += 1
@@ -650,10 +670,9 @@ def stats(group_id: Optional[str] = None):
             s["applicable"] += 1
             s["points"] += r.get("points") or 0
             s["max"] += r.get("max_points") or 0
-            if (r.get("points") or 0) < (r.get("max_points") or 0):
-                s["fail"] += 1
     scores = [e["final"]["score"]["final_score"] for e in evs if e["final"]["score"]["final_score"] is not None]
     return {
+        "criterion_filter_supported": True,
         "evaluated": len(evs),
         "avg_score": round(sum(scores) / len(scores), 2) if scores else None,
         "critical_count": sum(1 for e in evs if e["final"]["score"]["critical_flag"]),

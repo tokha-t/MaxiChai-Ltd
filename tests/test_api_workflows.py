@@ -487,3 +487,165 @@ def test_worker_start_failure_does_not_leave_running_job(api, job_dialogs, pendi
     retry = api.evaluate({"group_id": "DEV"})
     assert retry["job_id"] != failed["job_id"]
     assert len(pending_threads) == 1
+
+
+@pytest.fixture
+def criterion_filter_data(api):
+    checklist = api.checklist_save({"data": {
+        "name": "Criterion filter coverage",
+        "criteria": [
+            {"id": "contact", "name": "Контакт", "description": "Поздоровался", "type": "binary",
+             "weight": 40, "na_allowed": True, "na_condition": "Нет реплик оператора"},
+            {"id": "consultation", "name": "Консультация", "description": "Полнота ответа", "type": "scale",
+             "weight": 60, "na_allowed": True, "na_condition": "Нет запроса",
+             "scale": [{"value": 0}, {"value": 10}, {"value": 20}]},
+            {"id": "critical", "name": "Грубая ошибка", "description": "Грубая ошибка", "type": "flag", "weight": 0},
+            {"id": "zero_weight", "name": "Без веса", "description": "Критерий без веса", "type": "binary", "weight": 0},
+        ],
+    }})
+
+    def add(cid, group, contact=True, consultation=20, critical=False, zero_weight=False,
+            language="RU", channel="agent chat"):
+        api.upload({
+            "conversation_id": cid, "group_id": group, "language": language, "channel": channel,
+            "text": "[00:00] Клиент: Привет\n[00:01] Оператор: Здравствуйте",
+        })
+        result = evaluate_conversation(api.store.get_conversation(cid), checklist, api.client, votes=1)
+        assert result["status"] == "ok"
+        result = rescore(result, checklist, {
+            "contact": contact, "consultation": consultation,
+            "critical": critical, "zero_weight": zero_weight,
+        })
+        return api.store.save_evaluation(result, checklist["_id"])
+
+    add("dev-fail", "DEV", contact=False, consultation=10, critical=True)
+    add("dev-pass", "DEV", zero_weight=True, language="EN", channel="call")
+    add("dev-partial", "DEV", consultation=0, channel="call")
+    add("dev-na", "DEV", contact=None, consultation=None)
+    add("dev-error", "DEV", contact=False, consultation=0, critical=True)
+    api.store.save_evaluation({
+        "conversation_id": "dev-error", "status": "error", "error": "Последняя оценка завершилась ошибкой",
+        "criteria": [], "score": None, "model": "mock",
+    }, checklist["_id"])
+    api.upload({"conversation_id": "dev-unscored", "group_id": "DEV", "text": "Клиент: Привет"})
+    add("prod-fail", "PROD", contact=False, consultation=10, critical=True)
+    add("prod-pass", "PROD")
+    add("prod-na", "PROD", contact=None, consultation=None)
+    return add
+
+
+@pytest.mark.parametrize("criterion_id,expected", [
+    ("contact", {"dev-fail"}),
+    ("consultation", {"dev-fail", "dev-partial"}),
+    ("critical", {"dev-fail"}),
+    ("zero_weight", set()),
+])
+def test_criterion_violation_filters_binary_scale_flag_and_zero_weight(api, criterion_filter_data, criterion_id, expected):
+    rows = api.conversations(group_id="DEV", criterion_id=criterion_id, criterion_violation=True)
+
+    assert {row["conversation_id"] for row in rows} == expected
+
+
+@pytest.mark.parametrize("criterion_id,expected", [
+    ("contact", {"dev-fail", "dev-pass", "dev-partial"}),
+    ("consultation", {"dev-fail", "dev-pass", "dev-partial"}),
+    ("critical", {"dev-fail", "dev-pass", "dev-partial", "dev-na"}),
+    ("zero_weight", {"dev-fail", "dev-pass", "dev-partial", "dev-na"}),
+])
+def test_criterion_alone_and_false_include_all_applicable_final_values(api, criterion_filter_data, criterion_id, expected):
+    default_rows = api.conversations(group_id="DEV", criterion_id=criterion_id)
+    false_rows = api.conversations(group_id="DEV", criterion_id=criterion_id, criterion_violation=False)
+
+    assert {row["conversation_id"] for row in default_rows} == expected
+    assert false_rows == default_rows
+
+
+def test_criterion_filter_excludes_unscored_latest_error_missing_and_unknown(api, criterion_filter_data):
+    evaluation_id = criterion_filter_data("missing-contact", "MISSING")
+    result = api.store.get_evaluation(evaluation_id)
+    result["criteria"] = [row for row in result["criteria"] if row["criterion_id"] != "contact"]
+    api.store.save_evaluation(result, result["_checklist_id"])
+
+    assert {row["conversation_id"] for row in api.conversations(group_id="DEV")} >= {"dev-error", "dev-unscored"}
+    filtered = api.conversations(group_id="DEV", criterion_id="contact")
+    assert not ({row["conversation_id"] for row in filtered} & {"dev-error", "dev-unscored"})
+    assert api.conversations(group_id="MISSING", criterion_id="contact") == []
+    assert [row["conversation_id"] for row in api.conversations(group_id="MISSING", criterion_id="consultation")] == ["missing-contact"]
+    assert api.conversations(criterion_id="unknown_criterion") == []
+    assert api.conversations(criterion_id="unknown_criterion", criterion_violation=True) == []
+
+
+@pytest.mark.parametrize("group", ["DEV", "PROD", None, ""])
+def test_each_criterion_filtered_count_matches_dashboard_fail_count(api, criterion_filter_data, group):
+    stats = api.stats(group)
+
+    assert stats["criterion_filter_supported"] is True
+    for criterion in stats["criteria"]:
+        rows = api.conversations(group_id=group, criterion_id=criterion["criterion_id"], criterion_violation=True)
+        assert len(rows) == criterion["fail"], criterion["criterion_id"]
+        assert len({row["conversation_id"] for row in rows}) == len(rows)
+        if group:
+            assert all(row["group_id"] == group for row in rows)
+
+
+def test_empty_group_advertises_criterion_filter_capability(api):
+    stats = api.stats("EMPTY")
+
+    assert stats["criterion_filter_supported"] is True
+    assert stats["criteria"] == []
+    assert api.conversations(group_id="EMPTY", criterion_id="contact", criterion_violation=True) == []
+
+
+@pytest.mark.parametrize("criterion_id,before,after,before_fail,after_fail", [
+    ("contact", True, False, False, True),
+    ("contact", False, True, True, False),
+    ("consultation", 20, 10, False, True),
+    ("consultation", 10, 20, True, False),
+    ("critical", False, True, False, True),
+    ("critical", True, False, True, False),
+    ("contact", False, None, True, False),
+    ("consultation", 10, None, True, False),
+])
+def test_criterion_filter_and_stats_follow_appeals_in_both_directions(
+        api, criterion_filter_data, criterion_id, before, after, before_fail, after_fail):
+    evaluation_id = criterion_filter_data("appeal-filter", "APPEAL", **{criterion_id: before})
+    initial = api.conversations(group_id="APPEAL", criterion_id=criterion_id, criterion_violation=True)
+    assert bool(initial) is before_fail
+    appeal = api.appeal_create({
+        "evaluation_id": evaluation_id, "criterion_id": criterion_id,
+        "comment": "Прошу пересмотреть", "ai_review": False,
+    })
+
+    api.appeal_decide(appeal["id"], {"decision": "changed", "value": after, "reason": "Перепроверено"})
+
+    filtered = api.conversations(group_id="APPEAL", criterion_id=criterion_id, criterion_violation=True)
+    assert bool(filtered) is after_fail
+    applicable = api.conversations(group_id="APPEAL", criterion_id=criterion_id)
+    assert bool(applicable) is (after is not None)
+    stats_row = next(row for row in api.stats("APPEAL")["criteria"] if row["criterion_id"] == criterion_id)
+    assert stats_row["fail"] == len(filtered)
+    original = api.store.get_evaluation(evaluation_id)
+    assert next(row for row in original["criteria"] if row["criterion_id"] == criterion_id)["value"] == before
+
+
+def test_criterion_filter_combines_with_existing_dialog_filters(api, criterion_filter_data):
+    rows = api.conversations(
+        group_id="DEV", language="ru", channel="CHAT", q="FAIL", critical=True, needs_review=True,
+        criterion_id="contact", criterion_violation=True,
+    )
+
+    assert [row["conversation_id"] for row in rows] == ["dev-fail"]
+    assert api.conversations(group_id="DEV", language="EN", criterion_id="contact", criterion_violation=True) == []
+    assert [row["conversation_id"] for row in api.conversations(
+        group_id="DEV", language="RU", channel="call", q="partial", critical=False,
+        criterion_id="consultation", criterion_violation=True,
+    )] == ["dev-partial"]
+
+
+def test_criterion_violation_requires_id_but_false_preserves_plain_list(api, criterion_filter_data):
+    with pytest.raises(HTTPException) as exc:
+        api.conversations(criterion_violation=True)
+
+    assert exc.value.status_code == 400
+    assert "criterion_id" in exc.value.detail
+    assert api.conversations(criterion_violation=False) == api.conversations()
