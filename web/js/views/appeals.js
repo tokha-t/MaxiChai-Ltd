@@ -8,6 +8,8 @@ let pollTimer = null;
 const drafts = new Map();
 const submitting = new Set();
 
+const valueLabel = (label) => label === "N/A" ? "Не применяется (N/A)" : label ?? "Не указано";
+
 function rememberForms(root) {
   root.querySelectorAll("form[data-decide]").forEach((form) => {
     const fields = form.elements;
@@ -127,13 +129,13 @@ export async function renderAppeals(root, params = [], query = null, alive = () 
 
 function aiReviewHtml(a) {
   const ai = a.ai_review;
-  const recommendation = ai?.recommendation === "change" ? `изменить на «${ai.suggested_label ?? "значение не указано"}»`
+  const recommendation = ai?.recommendation === "change" ? `изменить на «${valueLabel(ai.suggested_label)}»`
     : ai?.recommendation === "keep" ? "оставить оценку" : "не сформирована";
-  return `${ai ? (ai.error ? `<p class="muted">Второе мнение ИИ недоступно. Можно повторить запрос; решение проверяющего ещё не принято.</p>` :
+  return `${ai ? (ai.error ? `<p class="muted">Второе мнение ИИ недоступно.${a.status === "open" ? " Можно повторить запрос; решение проверяющего ещё не принято." : " Решение проверяющего показано отдельно."}</p>` :
     `<div class="ai-recommendation"><b>Рекомендация ИИ: ${esc(recommendation)}</b>
     <p>${esc(ai.rationale || "Обоснование не получено.")}</p>
     ${ai.model ? `<details><summary>Технические сведения рекомендации</summary><span class="muted small">Модель: ${esc(ai.model)}</span></details>` : ""}</div>`)
-    : `<p class="muted">Второе мнение ИИ готовится… Это не решение по апелляции.</p>`}
+    : `<p class="muted">${a.status === "open" ? "Второе мнение ИИ готовится… Это не решение по апелляции." : "Второе мнение ИИ не получено. Решение проверяющего показано отдельно."}</p>`}
     ${a.status === "open" ? ` <button class="btn" data-reai="${a.id}" aria-label="Повторить запрос второго мнения для ${esc(a.criterion?.name || a.criterion_id)}">Запросить второе мнение заново</button>` : ""}`;
 }
 
@@ -162,7 +164,7 @@ function appealHtml(a) {
     ${appealTimeline(a)}
     <div class="appeal-grid">
       <div class="stack">
-        <div><span class="muted small">Оценка ИИ:</span> <b>${esc(a.original_label)}</b>
+        <div><span class="muted small">Оценка ИИ:</span> <b>${esc(valueLabel(a.original_label))}</b>
           ${a.final_score !== undefined ? `<span class="muted small"> · итог диалога: ИИ ${fmtScore(a.ai_final_score)}${a.status !== "open" ? ` → ${fmtScore(a.final_score)}` : ""}</span>` : ""}</div>
         <div class="quote"><span class="muted small">Обоснование ИИ:</span><br>${esc(orig.rationale || "")}</div>
         <div class="quote"><span class="muted small">Комментарий оператора:</span><br>${esc(a.comment || "—")}</div>
@@ -183,8 +185,8 @@ function appealHtml(a) {
             <label class="field"><span>Причина решения (обязательно)</span><textarea name="reason" required rows="3"></textarea></label>
             <div class="row"><label class="field"><span>Проверяющий</span><input type="text" name="reviewer" value="Проверяющий"></label><span class="spacer"></span><button class="btn primary" type="submit">Сохранить решение</button></div>
           </form>` : `<div class="human-decision-status"><h3>Решение проверяющего: ожидается</h3><p class="muted">После решения здесь появятся результат и его причина.</p></div>`)
-        : `<div class="decision"><h3>Решение проверяющего</h3> ${a.status === "changed" ? `«${esc(a.original_label)}» → «${esc(a.decision_label)}»` : `«${esc(a.original_label)}» — оценка подтверждена`}<br>
-            <span class="muted small">Причина: ${esc(a.decision_reason || "")} · ${esc(a.reviewer || "")} · ${fmtDate(a.decided_at)}</span></div>`}
+        : `<div class="decision"><h3>Решение проверяющего</h3> ${a.status === "changed" ? `«${esc(valueLabel(a.original_label))}» → «${esc(valueLabel(a.decision_label))}»` : `«${esc(valueLabel(a.original_label))}» — оценка подтверждена`}<br>
+            <span class="muted small">Причина: ${esc(a.decision_reason || "")} · ${esc(a.reviewer || "")} · ${esc(fmtDate(a.decided_at))}</span></div>`}
       </div>
     </div>
   </article>`;
