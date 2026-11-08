@@ -20,10 +20,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .checklist import ensure_defaults, load_default, load_file, validate_checklist
-from .config import _judge, settings, with_judges
+from .config import ROOT, _judge, settings, with_judges
 from .dataset import get_group, records_from_upload, save_cache
 from .evaluator import evaluate_many
-from .export import build_results, write_results
+from .export import build_results, has_mock_evaluations, write_results
 from .llm import OpenAICompatibleClient, make_client
 from .store import Store
 from .validate import validate_file
@@ -116,11 +116,16 @@ def cmd_evaluate(args) -> None:
     print(f"Готово: {ok}/{total} без ошибок за {elapsed:.0f} с, стоимость ≈ ${done['cost']:.3f} "
           f"(≈ ${done['cost'] / max(1, total):.4f} за диалог). Журнал: {log_path}")
     if args.out:
+        target = Path(args.out)
+        submission_dirs = {(ROOT / "results").resolve(), Path("results").resolve()}
+        # os.replace заменяет сам файл-ссылку, поэтому разрешаем ссылки только в каталоге.
+        destination = target.parent.resolve() / target.name
+        if any(directory in destination.parents for directory in submission_dirs) and has_mock_evaluations(results):
+            sys.exit("в выгрузке есть оценки заглушки")
         used = sorted({v.get("model") for r in results if r.get("status") == "ok" for c in r["criteria"] for v in c.get("votes") or [] if v.get("model")})
         doc = build_results(results, [r["conversation_id"] for r in records],
                             model_name=" + ".join(used) if used else client.model, mode=cfg.model_mode)
         # проверяем во временном файле рядом; прежний results.json заменяется только проверенным документом
-        target = Path(args.out)
         tmp = target.with_name("." + target.name + ".tmp")
         write_results(doc, str(tmp))
         turn_counts = {r["conversation_id"]: len(r["transcript"]) for r in records}

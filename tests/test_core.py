@@ -5,16 +5,18 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 os.environ["LLM_PROVIDER"] = "mock"
 os.environ["CQA_DATA_DIR"] = str(Path(__file__).parent / "_tmp_data")
 os.environ["CQA_RUNS_DIR"] = str(Path(__file__).parent / "_tmp_runs")
 
 from cqa.checklist import ensure_defaults, load_default, validate_checklist, verdict_to_value  # noqa: E402
 from cqa.dataset import normalize_record, parse_plain_text, records_from_upload  # noqa: E402
-from cqa.evaluator import evaluate_conversation, rescore  # noqa: E402
+from cqa.evaluator import aggregate_votes, evaluate_conversation, rescore  # noqa: E402
 from cqa.export import build_results  # noqa: E402
 from cqa.facts import compute_facts, parse_ts  # noqa: E402
-from cqa.llm import JudgePanel, MockClient  # noqa: E402
+from cqa.llm import JudgePanel, LLMResult, MockClient  # noqa: E402
 from cqa.scoring import compute_score  # noqa: E402
 from cqa.validate import validate_results  # noqa: E402
 
@@ -187,3 +189,119 @@ def test_reimport_with_changed_transcript_marks_old_evaluation_stale(tmp_path):
     rec2["transcript"][0]["text"] = "Другой диалог с тем же ID"
     store.upsert_conversations([rec2], "G")
     assert store.latest_evaluation(rec["conversation_id"], ok_only=True) is None
+
+
+@pytest.mark.parametrize("evidence", [[999], [], None, [0, -1, "invalid"]])
+def test_fallback_evidence_requires_review_and_caps_confidence(evidence):
+    criterion = next(c for c in CL["criteria"] if c["id"] == "contact")
+    facts = compute_facts(BY_ID["p1-ru-006"])
+    vote = LLMResult(data={
+        "verdict": "yes", "rationale": "Оператор поздоровался.",
+        "evidence_turns": evidence, "confidence": 0.99,
+    }, raw="", model="test:evidence")
+
+    row = aggregate_votes(criterion, [vote], facts)
+
+    assert row["value"] is True
+    assert row["verdict"] == "yes"
+    assert row["rationale"] == vote.data["rationale"]
+    assert row["evidence_turns"] == [10]
+    assert row["evidence_fallback"] is True
+    assert row["needs_review"] is True
+    assert row["confidence"] <= 0.5
+    assert row["model_confidence"] == 0.99
+    assert row["votes"][0]["evidence_turns"] == evidence
+
+
+@pytest.mark.parametrize("evidence", [[10], [999, 10]])
+def test_valid_evidence_does_not_gain_fallback_or_review(evidence):
+    criterion = next(c for c in CL["criteria"] if c["id"] == "contact")
+    facts = compute_facts(BY_ID["p1-ru-006"])
+    vote = LLMResult(data={
+        "verdict": "yes", "rationale": "Оператор поздоровался.",
+        "evidence_turns": evidence, "confidence": 0.99,
+    }, raw="", model="test:evidence")
+
+    row = aggregate_votes(criterion, [vote], facts)
+
+    assert row["evidence_turns"] == [10]
+    assert row["evidence_fallback"] is False
+    assert row["needs_review"] is False
+    assert row["confidence"] > 0.5
+
+
+class EvidenceClient(MockClient):
+    """Offline model response with controlled evidence and high self-confidence."""
+
+    def __init__(self, evidence):
+        super().__init__("mock:evidence")
+        self.evidence = evidence
+
+    def complete_json(self, messages, schema=None):
+        result = super().complete_json(messages, schema)
+        rows = result.data["criteria"].values() if "criteria" in result.data else [result.data]
+        for row in rows:
+            row["evidence_turns"] = list(self.evidence)
+            row["confidence"] = 0.99
+        return result
+
+
+@pytest.mark.parametrize("mode", ["batch", "per_criterion"])
+def test_pipeline_fallback_preserves_values_scores_and_export_schema(mode):
+    record = BY_ID["p1-ru-006"]
+    valid = evaluate_conversation(record, CL, EvidenceClient([10]), votes=1, mode=mode)
+    fallback = evaluate_conversation(record, CL, EvidenceClient([999]), votes=1, mode=mode)
+
+    assert fallback["status"] == valid["status"] == "ok"
+    assert fallback["score"] == valid["score"]
+    assert [(r["criterion_id"], r["value"], r["points"]) for r in fallback["criteria"]] == [
+        (r["criterion_id"], r["value"], r["points"]) for r in valid["criteria"]
+    ]
+    for row in fallback["criteria"]:
+        assert row["evidence_fallback"] is True
+        assert row["needs_review"] is True
+        assert row["confidence"] <= 0.5
+        assert row["evidence_turns"]
+        assert all(1 <= n <= len(record["transcript"]) for n in row["evidence_turns"])
+    contact = next(r for r in fallback["criteria"] if r["criterion_id"] == "contact")
+    assert contact["evidence_turns"] == [10]
+
+    doc = build_results([fallback], [record["conversation_id"]], model_name="test:evidence")
+    assert doc["schema_version"] == "1.0"
+    assert all(set(row) == {"criterion_id", "value", "rationale", "evidence_turns"}
+               for row in doc["results"][0]["criteria"])
+    assert validate_results(doc, [record["conversation_id"]], {record["conversation_id"]: len(record["transcript"])})[0] == []
+
+
+def test_fallback_marker_survives_storage_weight_reuse_and_rescore(tmp_path, monkeypatch):
+    from cqa.store import Store
+
+    record = BY_ID["p1-ru-006"]
+    client = EvidenceClient([999])
+    first = evaluate_conversation(record, CL, client, votes=1)
+    store = Store(tmp_path / "evidence.sqlite")
+    try:
+        store.upsert_conversations([record], "DEV")
+        evaluation_id = store.save_evaluation(first, None)
+        previous = store.get_evaluation(evaluation_id)
+        assert all(row["evidence_fallback"] is True for row in previous["criteria"])
+
+        changed = json.loads(json.dumps(CL))
+        next(c for c in changed["criteria"] if c["id"] == "closure")["weight"] = 25
+
+        def unexpected_call(*args, **kwargs):
+            pytest.fail("Смена веса не должна вызывать модель")
+
+        monkeypatch.setattr(client, "complete_json", unexpected_call)
+        reused = evaluate_conversation(record, changed, client, votes=1, previous=previous)
+        rescored = rescore(reused, changed, {"empathy": False})
+
+        assert reused["usage"]["calls"] == 0
+        assert all(row["reused"] for row in reused["criteria"])
+        assert next(row for row in rescored["criteria"] if row["criterion_id"] == "empathy")["value"] is False
+        for result in (reused, rescored):
+            assert result["status"] == "ok"
+            assert all(row["evidence_fallback"] is True for row in result["criteria"])
+            assert all(row["needs_review"] is True and row["confidence"] <= 0.5 for row in result["criteria"])
+    finally:
+        store.conn.close()

@@ -22,7 +22,7 @@ from cqa.checklist import OFFICIAL_IDS, ensure_defaults, load_default, scale_ste
 from cqa.config import ROOT, settings
 from cqa.dataset import fetch_group, parse_plain_text, records_from_upload, save_cache
 from cqa.evaluator import evaluate_many, rescore, review_appeal
-from cqa.export import build_results, write_results
+from cqa.export import build_results, has_mock_evaluations, write_results
 from cqa.validate import validate_file
 from cqa.facts import build_turns, compute_facts
 from cqa.llm import make_client
@@ -355,13 +355,6 @@ def checklist_activate(cl_id: int):
 # ---------------- оценка ----------------
 def _run_job(job_id: str, convs: List[Dict[str, Any]], checklist: Dict[str, Any], votes: Optional[int], reuse: bool,
              force: Optional[List[str]]):
-    previous = {}
-    if reuse:
-        for c in convs:
-            prev = store.latest_evaluation(c["conversation_id"], ok_only=True)
-            if prev:
-                previous[c["conversation_id"]] = prev
-
     def on_done(res):
         eval_id = store.save_evaluation(res, checklist.get("_id"))
         with JOBS_LOCK:
@@ -375,6 +368,12 @@ def _run_job(job_id: str, convs: List[Dict[str, Any]], checklist: Dict[str, Any]
                                    "critical_flag": (res.get("score") or {}).get("critical_flag")})
 
     try:
+        previous = {}
+        if reuse:
+            for c in convs:
+                prev = store.latest_evaluation(c["conversation_id"], ok_only=True)
+                if prev:
+                    previous[c["conversation_id"]] = prev
         evaluate_many(convs, checklist, client, votes=votes, previous=previous, force=force, on_done=on_done)
         status = "done"
     except Exception as exc:  # noqa: BLE001
@@ -402,13 +401,34 @@ def evaluate(body: Dict[str, Any] = Body(...)):
     checklist = store.get_checklist(body["checklist_id"]) if body.get("checklist_id") else store.active_checklist()
     if not checklist:
         _err(404, "Чек-лист не найден")
+    group_id = body.get("group_id") or None
+    if "group_id" not in body:
+        groups = {c.get("group_id") for c in convs}
+        if len(groups) == 1:
+            group_id = groups.pop() or None
+    votes = body.get("votes") or settings.llm_votes
     job_id = uuid.uuid4().hex[:10]
     with JOBS_LOCK:
+        for current in JOBS.values():
+            if current["status"] != "running":
+                continue
+            same_group = group_id is not None and current.get("group_id") == group_id
+            if same_group or set(ids).intersection(current.get("conversation_ids") or []):
+                raise HTTPException(status_code=409, detail={
+                    "message": "Оценка этой группы или выбранных диалогов уже выполняется",
+                    "job_id": current["job_id"],
+                })
         JOBS[job_id] = {"job_id": job_id, "status": "running", "total": len(convs), "done": 0, "results": [],
                         "cost_usd": 0.0, "llm_calls": 0, "started_at": time.time(), "finished_at": None, "error": None,
+                        "group_id": group_id, "conversation_ids": list(ids), "votes": votes,
                         "checklist_id": checklist.get("_id"), "checklist_version": checklist.get("version")}
-    threading.Thread(target=_run_job, args=(job_id, convs, checklist, body.get("votes"), body.get("reuse", True),
-                                            body.get("force")), daemon=True).start()
+    try:
+        threading.Thread(target=_run_job, args=(job_id, convs, checklist, votes, body.get("reuse", True),
+                                                body.get("force")), daemon=True).start()
+    except Exception as exc:
+        with JOBS_LOCK:
+            JOBS[job_id].update(status="failed", error=str(exc), finished_at=time.time())
+        raise
     return {"job_id": job_id, "total": len(convs)}
 
 
@@ -427,7 +447,11 @@ def job(job_id: str):
 @app.get("/api/jobs")
 def jobs():
     with JOBS_LOCK:
-        return sorted(({k: v for k, v in j.items() if k != "results"} for j in JOBS.values()), key=lambda x: -x["started_at"])[:20]
+        recent = sorted(({k: v for k, v in j.items() if k != "results"} for j in JOBS.values()),
+                        key=lambda x: -x["started_at"])
+    running = [j for j in recent if j["status"] == "running"]
+    completed = [j for j in recent if j["status"] != "running"][:20]
+    return sorted(running + completed, key=lambda x: -x["started_at"])
 
 
 @app.get("/api/evaluations/{eval_id}")
@@ -570,11 +594,16 @@ def results_save(body: Dict[str, Any] = Body(...)):
     if not ids:
         _err(400, f"В группе {group!r} нет диалогов")
     results = [r for r in (store.latest_evaluation(cid) for cid in ids) if r]
+    path = ROOT / "results" / target / "results.json"
+    if has_mock_evaluations(results):
+        return {"path": str(path.relative_to(ROOT)), "saved": False, "count": len(ids),
+                "ok": sum(1 for r in results if r.get("status") == "ok"),
+                "not_evaluated": len(ids) - len(results),
+                "errors": ["в выгрузке есть оценки заглушки"], "warnings": []}
     used = sorted({v.get("model") for r in results if r.get("status") == "ok" for c in r["criteria"]
                    for v in c.get("votes") or [] if v.get("model")})
     doc = build_results(results, ids, model_name=" + ".join(used) if used else client.model, mode=settings.model_mode,
                         criteria_order=OFFICIAL_IDS)
-    path = ROOT / "results" / target / "results.json"
     turn_counts = {}
     for cid in ids:
         conv = store.get_conversation(cid)

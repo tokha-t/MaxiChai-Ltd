@@ -288,3 +288,202 @@ def test_checklist_accepts_positive_integer_response_threshold(api):
 
     assert saved["first_response_threshold_sec"] == 1
     assert api.store.active_checklist()["_id"] == saved["_id"]
+
+
+@pytest.fixture
+def job_dialogs(api):
+    for cid, group in [("dev-one", "DEV"), ("dev-two", "DEV"), ("prod-one", "PROD"), ("prod-two", "PROD")]:
+        api.upload({
+            "conversation_id": cid, "group_id": group,
+            "text": "Клиент: Привет\nОператор: Здравствуйте",
+        })
+
+
+@pytest.fixture
+def pending_threads(api, monkeypatch):
+    started = []
+
+    class PendingThread:
+        def __init__(self, target, args, daemon):
+            self.target, self.args = target, args
+
+        def start(self):
+            started.append(self)
+
+    # Do not replace threading.Thread globally: concurrency tests use real threads.
+    monkeypatch.setattr(api, "threading", SimpleNamespace(Thread=PendingThread))
+    return started
+
+
+@pytest.mark.parametrize("first,second", [
+    ({"group_id": "DEV", "conversation_ids": ["dev-one"]},
+     {"group_id": "DEV", "conversation_ids": ["dev-two"]}),
+    ({"conversation_ids": ["dev-one"]}, {"conversation_ids": ["dev-two"]}),
+    ({"group_id": "DEV", "conversation_ids": ["dev-one"]},
+     {"group_id": "PROD", "conversation_ids": ["dev-one"]}),
+    ({"conversation_ids": ["dev-one", "prod-one"]},
+     {"conversation_ids": ["prod-one", "prod-two"]}),
+])
+def test_evaluate_rejects_running_group_or_overlapping_ids(api, job_dialogs, pending_threads, first, second):
+    running = api.evaluate(first)
+
+    with pytest.raises(HTTPException) as exc:
+        api.evaluate(second)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["job_id"] == running["job_id"]
+    assert exc.value.detail["message"]
+    assert len(api.JOBS) == len(pending_threads) == 1
+
+
+def test_evaluate_allows_independent_groups_and_exposes_job_context(api, job_dialogs, pending_threads, monkeypatch):
+    monkeypatch.setattr(settings, "llm_votes", 3)
+    dev = api.evaluate({"group_id": "DEV"})
+    prod = api.evaluate({"conversation_ids": ["prod-one"], "votes": 2})
+
+    jobs = {row["job_id"]: row for row in api.jobs()}
+    assert len(jobs) == len(pending_threads) == 2
+    assert jobs[dev["job_id"]]["group_id"] == "DEV"
+    assert jobs[dev["job_id"]]["votes"] == 3
+    assert jobs[dev["job_id"]]["done"] == 0
+    assert jobs[dev["job_id"]]["total"] == 2
+    assert set(jobs[dev["job_id"]]["conversation_ids"]) == {"dev-one", "dev-two"}
+    assert jobs[prod["job_id"]]["group_id"] == "PROD"
+    assert jobs[prod["job_id"]]["votes"] == 2
+    assert jobs[prod["job_id"]]["total"] == 1
+    assert all(row["status"] == "running" and "results" not in row for row in jobs.values())
+
+
+def test_evaluate_mixed_group_ids_have_no_inferred_group(api, job_dialogs, pending_threads):
+    response = api.evaluate({"conversation_ids": ["dev-one", "prod-one"]})
+
+    assert api.job(response["job_id"])["group_id"] is None
+
+
+@pytest.mark.parametrize("status", ["done", "failed"])
+def test_evaluate_can_restart_finished_or_failed_jobs(api, job_dialogs, pending_threads, status):
+    first = api.evaluate({"group_id": "DEV"})
+    api.JOBS[first["job_id"]]["status"] = status
+
+    second = api.evaluate({"group_id": "DEV"})
+
+    assert second["job_id"] != first["job_id"]
+    assert len(pending_threads) == 2
+    assert api.job(second["job_id"])["status"] == "running"
+
+
+def test_jobs_reports_progress_and_effective_votes_after_each_result(api, job_dialogs, pending_threads, monkeypatch):
+    monkeypatch.setattr(settings, "llm_votes", 3)
+    snapshots = []
+
+    def evaluate(convs, checklist, client, votes, previous, force, on_done):
+        assert votes == 3
+        for conv in convs:
+            result = evaluate_conversation(conv, checklist, client, votes=1)
+            on_done(result)
+            snapshots.append(api.jobs()[0])
+
+    monkeypatch.setattr(api, "evaluate_many", evaluate)
+    response = api.evaluate({"group_id": "DEV"})
+    thread = pending_threads[0]
+    thread.target(*thread.args)
+
+    assert [snapshot["done"] for snapshot in snapshots] == [1, 2]
+    assert all(snapshot["status"] == "running" for snapshot in snapshots)
+    assert all(snapshot["total"] == 2 and snapshot["votes"] == 3 for snapshot in snapshots)
+    assert all(snapshot["group_id"] == "DEV" for snapshot in snapshots)
+    completed = api.job(response["job_id"])
+    assert completed["status"] == "done"
+    assert completed["done"] == completed["total"] == 2
+    assert len(completed["results"]) == 2
+
+
+def test_jobs_keeps_old_running_jobs_after_many_completed_jobs(api, job_dialogs, pending_threads):
+    dev = api.evaluate({"group_id": "DEV"})
+    prod = api.evaluate({"group_id": "PROD"})
+    api.JOBS[dev["job_id"]]["started_at"] = 1
+    api.JOBS[prod["job_id"]]["started_at"] = 2
+    template = api.JOBS[dev["job_id"]]
+    for index in range(30):
+        job_id = f"finished-{index}"
+        api.JOBS[job_id] = dict(template, job_id=job_id, status="done", started_at=100 + index)
+
+    jobs = api.jobs()
+
+    assert len(jobs) == 22
+    assert {row["job_id"] for row in jobs if row["status"] == "running"} == {dev["job_id"], prod["job_id"]}
+    assert [row["started_at"] for row in jobs] == sorted((row["started_at"] for row in jobs), reverse=True)
+    assert {row["job_id"] for row in jobs if row["status"] == "done"} == {f"finished-{i}" for i in range(10, 30)}
+
+
+def test_evaluate_concurrent_requests_start_only_one_worker(api, job_dialogs, pending_threads, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    conv = api.store.get_conversation("dev-one")
+    checklist = api.store.active_checklist()
+    barrier = Barrier(2)
+
+    def active_checklist():
+        barrier.wait(timeout=5)
+        return checklist
+
+    # Readers return immutable snapshots; worker threads never open SQLite connections.
+    monkeypatch.setattr(api.store, "get_conversation", lambda cid: conv)
+    monkeypatch.setattr(api.store, "active_checklist", active_checklist)
+
+    def request():
+        try:
+            return api.evaluate({"conversation_ids": ["dev-one"]})
+        except HTTPException as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _: request(), range(2)))
+
+    successful = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+    rejected = [outcome for outcome in outcomes if isinstance(outcome, HTTPException)]
+    assert len(successful) == len(rejected) == 1
+    assert rejected[0].status_code == 409
+    assert rejected[0].detail["job_id"] == successful[0]["job_id"]
+    assert len(api.JOBS) == len(pending_threads) == 1
+
+
+def test_job_loading_previous_failure_does_not_block_retry(api, job_dialogs, pending_threads, monkeypatch):
+    response = api.evaluate({"group_id": "DEV"})
+
+    def broken_previous(*args, **kwargs):
+        raise RuntimeError("previous read failed")
+
+    monkeypatch.setattr(api.store, "latest_evaluation", broken_previous)
+    thread = pending_threads[0]
+    thread.target(*thread.args)
+
+    failed = api.job(response["job_id"])
+    assert failed["status"] == "failed"
+    assert failed["error"] == "previous read failed"
+    assert failed["finished_at"] is not None
+    retry = api.evaluate({"group_id": "DEV"})
+    assert retry["job_id"] != response["job_id"]
+    assert len(pending_threads) == 2
+
+
+def test_worker_start_failure_does_not_leave_running_job(api, job_dialogs, pending_threads, monkeypatch):
+    thread_class = api.threading.Thread
+    original_start = thread_class.start
+
+    def broken_start(self):
+        raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(thread_class, "start", broken_start)
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        api.evaluate({"group_id": "DEV"})
+
+    failed = api.jobs()[0]
+    assert failed["status"] == "failed"
+    assert "thread start failed" in failed["error"]
+    assert failed["finished_at"] is not None
+    monkeypatch.setattr(thread_class, "start", original_start)
+    retry = api.evaluate({"group_id": "DEV"})
+    assert retry["job_id"] != failed["job_id"]
+    assert len(pending_threads) == 1

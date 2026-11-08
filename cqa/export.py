@@ -9,6 +9,17 @@ from .checklist import OFFICIAL_IDS
 from .config import settings
 
 
+def has_mock_evaluations(results: List[Dict[str, Any]]) -> bool:
+    """Проверяем происхождение до выгрузки: формат 1.0 не содержит моделей отдельных голосов."""
+    for result in results:
+        if (result.get("model") or "").startswith("mock"):
+            return True
+        for criterion in result.get("criteria") or []:
+            if any((vote.get("model") or "").startswith("mock") for vote in criterion.get("votes") or []):
+                return True
+    return False
+
+
 def _criterion_out(row: Dict[str, Any]) -> Dict[str, Any]:
     value = row.get("value")
     if row.get("type") == "scale" and value is not None:

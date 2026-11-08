@@ -90,17 +90,23 @@ def aggregate_votes(c: Dict[str, Any], votes: List[LLMResult], facts: Dict[str, 
     agreement = len(agreeing) / len(parsed)
     self_conf = [float(v.data.get("confidence") or 0) for v in agreeing] or [0.0]
     model_conf = sum(self_conf) / len(self_conf)
-    evidence = _clean_turns(rep.data.get("evidence_turns"), facts.get("n_turns") or 0) or _default_evidence(c["id"], facts)
+    evidence = _clean_turns(rep.data.get("evidence_turns"), facts.get("n_turns") or 0)
+    evidence_fallback = not evidence
+    confidence = round(agreement * 0.7 + max(0.0, min(1.0, model_conf)) * 0.3, 2)
+    if evidence_fallback:
+        evidence = _default_evidence(c["id"], facts)
+        confidence = min(confidence, 0.5)
     return {
         "value": final,
         "verdict": rep.data.get("verdict"),
         "rationale": (rep.data.get("rationale") or "").strip() or "Обоснование не получено.",
         "analysis": (rep.data.get("analysis") or "").strip(),
         "evidence_turns": evidence,
+        "evidence_fallback": evidence_fallback,
         "agreement": round(agreement, 2),
         "model_confidence": round(max(0.0, min(1.0, model_conf)), 2),
-        "confidence": round(agreement * 0.7 + max(0.0, min(1.0, model_conf)) * 0.3, 2),
-        "needs_review": agreement < 1.0 or model_conf < 0.6,
+        "confidence": confidence,
+        "needs_review": evidence_fallback or agreement < 1.0 or model_conf < 0.6,
         "votes": [
             {"verdict": v.data.get("verdict"), "rationale": v.data.get("rationale"),
              "evidence_turns": v.data.get("evidence_turns"), "confidence": v.data.get("confidence"), "model": v.model}
@@ -191,6 +197,7 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
         if prev and prev.get("def_hash") == h and c["id"] not in force:
             keep = {k: prev.get(k) for k in ("value", "verdict", "rationale", "analysis", "evidence_turns", "agreement",
                                               "model_confidence", "confidence", "needs_review", "votes")}
+            keep["evidence_fallback"] = bool(prev.get("evidence_fallback"))
             rows[c["id"]] = _criterion_row(c, keep, h, reused=True)
         else:
             todo.append(c)
