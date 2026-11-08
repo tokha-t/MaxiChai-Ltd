@@ -1,6 +1,24 @@
 <!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><title>CQA</title></head>
-<body style="font-family:system-ui;padding:24px">
-<h1>CQA API работает</h1>
-<p>Интерфейс собирается по CODEX_TASKS.md. Документация API: <a href="/docs">/docs</a></p>
-</body></html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CQA · Контроль качества диалогов</title><link rel="stylesheet" href="./css/styles.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header class="topbar">
+<a class="brand" href="#/dialogs" aria-label="CQA · Контроль качества диалогов"><span class="logo">M</span><span><b>CQA</b><small>Контроль качества диалогов</small></span></a>
+<nav id="nav" aria-label="Основная навигация">
+<a href="#/dialogs" data-route="dialogs">Диалоги</a>
+<a href="#/appeals" data-route="appeals">Апелляции <span class="badge" id="appealsCount"></span></a>
+<a href="#/checklist" data-route="checklist">Чек-лист</a>
+<a href="#/dashboard" data-route="dashboard">Дашборд</a>
+<a href="#/settings" data-route="settings">Настройки</a>
+</nav>
+<div class="role"><span>Роль</span><div class="seg" id="roleSwitch"><button type="button" data-role="operator">Оператор</button><button type="button" data-role="reviewer">Проверяющий</button></div></div>
+</header>
+<main id="app"><div class="loading">Загрузка…</div></main>
+<div id="modal-root"></div><div id="toasts" aria-live="polite"></div>
+<script type="module" src="./js/app.js"></script>
+</body>
+</html>

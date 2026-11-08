@@ -21,7 +21,8 @@ from cqa.checklist import OFFICIAL_IDS, ensure_defaults, load_default, validate_
 from cqa.config import ROOT, settings
 from cqa.dataset import fetch_group, parse_plain_text, records_from_upload, save_cache
 from cqa.evaluator import evaluate_many, rescore, review_appeal
-from cqa.export import build_results
+from cqa.export import build_results, write_results
+from cqa.validate import validate_file
 from cqa.facts import build_turns, compute_facts
 from cqa.llm import make_client
 from cqa.store import Store
@@ -31,6 +32,26 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 store = Store()
 client = make_client()
+
+
+def _import_cached_groups() -> None:
+    """Если набор уже скачан в data/<GROUP>.json, а в базе его нет — загрузить при старте."""
+    known = {g["group_id"] for g in store.groups()}
+    for path in sorted(settings.data_dir.glob("*.json")):
+        group = path.stem
+        if group in known:
+            continue
+        try:
+            import json as _json
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            records = data.get("records") if isinstance(data, dict) else None
+            if records:
+                store.upsert_conversations(records, group)
+        except Exception:  # noqa: BLE001 — битый кэш не должен ронять сервер
+            continue
+
+
+_import_cached_groups()
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 
@@ -76,6 +97,112 @@ def config():
     return {"model": client.model, "judges": _judges_info(), "mode": settings.model_mode, "llm_mode": settings.llm_mode,
             "team_name": settings.team_name, "votes": settings.llm_votes,
             "free": all(j.free for j in settings.judges)}
+
+
+# ---------------- настройки (ключи вводятся в интерфейсе, хранятся в .env на этом компьютере) ----------------
+ENV_PATH = ROOT / ".env"
+SETTING_FIELDS = {"org_api_url": "ORG_API_URL", "gemini_api_key": "GEMINI_API_KEY", "cerebras_api_key": "CEREBRAS_API_KEY",
+                  "llm_judges": "LLM_JUDGES", "team_name": "TEAM_NAME", "llm_votes": "LLM_VOTES"}
+
+
+def _recommended_judges() -> str:
+    try:
+        for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+            if line.startswith("LLM_JUDGES="):
+                return line.split("=", 1)[1].split("#")[0].strip()
+    except OSError:
+        pass
+    return "gemini:gemini-3.6-flash,gemini:gemini-3.5-flash-lite,cerebras:gpt-oss-120b"
+
+
+def _write_env(updates: Dict[str, str]) -> None:
+    import os
+    base = ENV_PATH if ENV_PATH.exists() else ROOT / ".env.example"
+    lines = base.read_text(encoding="utf-8").splitlines() if base.exists() else []
+    seen = set()
+    for i, line in enumerate(lines):
+        if "=" in line and not line.lstrip().startswith("#"):
+            k = line.split("=", 1)[0].strip()
+            if k in updates:
+                lines[i] = f"{k}={updates[k]}"
+                seen.add(k)
+    lines += [f"{k}={v}" for k, v in updates.items() if k not in seen]
+    ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        ENV_PATH.chmod(0o600)
+    except OSError:
+        pass
+    for k, v in updates.items():
+        os.environ[k] = v
+
+
+def _reload_settings() -> None:
+    global client
+    from cqa.config import load_settings
+    fresh = load_settings()
+    settings.__dict__.update(fresh.__dict__)
+    client = make_client(settings)
+
+
+def _settings_view() -> Dict[str, Any]:
+    url_ok = bool(settings.org_api_url) and "..." not in (settings.org_api_url or "")
+    judges = _judges_info()
+    return {
+        "org_api_url_set": url_ok,
+        "keys": {name: any(j.api_key for j in settings.judges if j.provider == prov)
+                 for name, prov in (("GEMINI_API_KEY", "gemini"), ("CEREBRAS_API_KEY", "cerebras"))},
+        "llm_judges": ",".join(j["label"] for j in judges),
+        "recommended_judges": _recommended_judges(),
+        "llm_votes": settings.llm_votes,
+        "llm_mode": settings.llm_mode,
+        "team_name": settings.team_name,
+        "mode": settings.model_mode,
+        "judges": judges,
+        "ready": url_ok and any(j["has_key"] for j in judges),
+    }
+
+
+@app.get("/api/settings")
+def settings_get():
+    return _settings_view()
+
+
+@app.post("/api/settings")
+def settings_save(body: Dict[str, Any] = Body(...)):
+    """Пустые поля не трогаем: ключ не стирается, если его не ввели заново."""
+    updates = {}
+    for field, env_key in SETTING_FIELDS.items():
+        value = body.get(field)
+        if value is None:
+            continue
+        value = str(value).strip().strip('"').strip("'")
+        if not value:
+            continue
+        if field == "org_api_url" and not value.startswith("http"):
+            _err(400, "Ссылка API должна начинаться с https://")
+        updates[env_key] = value
+    if updates.get("GEMINI_API_KEY") or updates.get("CEREBRAS_API_KEY"):
+        updates.setdefault("GEMINI_RPM", "5")
+        updates.setdefault("CEREBRAS_RPM", "5")
+    if updates:
+        _write_env(updates)
+        _reload_settings()
+    return _settings_view()
+
+
+@app.post("/api/settings/ping")
+def settings_ping():
+    msgs = [{"role": "system", "content": "Отвечай строго JSON-объектом."},
+            {"role": "user", "content": 'Верни {"ok": true, "answer": "<одно слово по-казахски: спасибо>"}'}]
+    out = []
+    for judge in client.judges:
+        started = time.time()
+        try:
+            r = judge.complete_json(msgs, None)
+            out.append({"label": judge.model, "ok": True, "latency_sec": round(time.time() - started, 1), "answer": r.data})
+        except Exception as exc:  # noqa: BLE001
+            out.append({"label": judge.model, "ok": False, "error": str(exc)[:300]})
+    return out
 
 
 # ---------------- данные ----------------
@@ -142,6 +269,8 @@ def conversations(group_id: Optional[str] = None, language: Optional[str] = None
                 "needs_review": any(r.get("needs_review") for r in ev.get("criteria") or []),
                 "checklist_version": ev.get("checklist_version"), "evaluated_at": ev.get("created_at"),
                 "cost_usd": (ev.get("usage") or {}).get("cost_usd"),
+                "critical_reason": next((r.get("rationale") for r in (ev["final"]["criteria"] if ok else [])
+                                         if r.get("type") == "flag" and r.get("value") is True), None),
             }
         if critical is not None and (not summary or bool(summary.get("critical_flag")) != critical):
             continue
@@ -399,6 +528,33 @@ def export(group_id: str, source: str = Query("ai", pattern="^(ai|final)$")):
         results.append(ev)
     doc = build_results(results, ids, model_name=client.model, mode=settings.model_mode, criteria_order=OFFICIAL_IDS)
     return JSONResponse(doc, headers={"Content-Disposition": f'attachment; filename="results_{group_id}.json"'})
+
+
+@app.post("/api/results/save")
+def results_save(body: Dict[str, Any] = Body(...)):
+    """{"group_id": "DEV", "target": "dev" | "prod"} → results/<target>/results.json (оценка системы) + проверка формата."""
+    group = (body.get("group_id") or "").strip()
+    target = (body.get("target") or "").strip()
+    if target not in ("dev", "prod"):
+        _err(400, "target: dev или prod")
+    ids = [c["conversation_id"] for c in store.list_conversations(group)]
+    if not ids:
+        _err(400, f"В группе {group!r} нет диалогов")
+    results = [r for r in (store.latest_evaluation(cid) for cid in ids) if r]
+    used = sorted({v.get("model") for r in results if r.get("status") == "ok" for c in r["criteria"]
+                   for v in c.get("votes") or [] if v.get("model")})
+    doc = build_results(results, ids, model_name=" + ".join(used) if used else client.model, mode=settings.model_mode,
+                        criteria_order=OFFICIAL_IDS)
+    path = ROOT / "results" / target / "results.json"
+    write_results(doc, str(path))
+    turn_counts = {}
+    for cid in ids:
+        conv = store.get_conversation(cid)
+        turn_counts[cid] = len(conv.get("transcript") or []) if conv else 0
+    errors, warnings = validate_file(str(path), ids, turn_counts, 10 if target == "prod" else None)
+    ok = sum(1 for r in doc["results"] if r["status"] == "ok")
+    return {"path": str(path.relative_to(ROOT)), "count": len(doc["results"]), "ok": ok,
+            "not_evaluated": len(ids) - len(results), "errors": errors, "warnings": warnings}
 
 
 @app.get("/api/stats")
