@@ -287,12 +287,13 @@ def conversation(cid: str):
     conv = store.get_conversation(cid)
     if not conv:
         _err(404, "Диалог не найден")
-    cl = store.active_checklist() or load_default()
+    ev = store.latest_evaluation(cid)
+    cl = _checklist_for(ev) if ev else store.active_checklist() or load_default()
     return {
         "conversation": {k: conv.get(k) for k in ("conversation_id", "channel", "language", "audio_url", "group_id")},
         "turns": build_turns(conv),
         "facts": compute_facts(conv, threshold_sec=int(cl.get("first_response_threshold_sec") or 180)),
-        "evaluation": final_view(store.latest_evaluation(cid)),
+        "evaluation": final_view(ev),
         "history": store.evaluation_history(cid),
         "appeals": store.list_appeals(conversation_id=cid),
     }
