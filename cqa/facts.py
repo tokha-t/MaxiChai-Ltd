@@ -16,7 +16,14 @@ _ISO_TS = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-
 P_TRANSFER = re.compile(r"эскалация на оператора|операторға жіберілді|transferred to an agent|агент присоединился|переведен от агента на представителя|agent joined", re.I)
 P_IDENTITY = re.compile(r"личность клиента подтверждена|жеке басы расталды|identity verified|identity confirmed", re.I)
 P_OP_CLOSED = re.compile(r"оператор закрыл чат|оператор чатты жапты|agent closed the chat|operator closed", re.I)
-P_CLIENT_GONE = re.compile(r"клиент покинул чат|соединение с клиентом прервано|байланыс үзілді|connection to customer lost|клиент завершил разговор|customer left|client left|customer disconnected", re.I)
+P_CLIENT_GONE = re.compile(
+    r"клиент покинул чат|соединение с клиентом прервано|байланыс үзілді|connection to customer lost|"
+    r"клиент завершил разговор|customer left|client left|customer disconnected|"
+    # Между субъектом и событием может стоять пояснение: «сұрағын жазбай тұрып, ...».
+    # Окончание утверждения исключает вопросы и отрицание последующей фразой.
+    r"\bклиент\b[^.!?\n]*\bчаттан\s+(?:шықты|шығып\s+кетті)\b(?=\s*(?:[.!]|$))",
+    re.I,
+)
 P_HOLD_END = re.compile(r"больше не находится на удержании|no longer on hold|removed from hold", re.I)
 P_HOLD_START = re.compile(r"находится на удержании|placed on hold|is on hold", re.I)
 P_REC_PAUSE = re.compile(r"приостановлен|paused|тоқтатыл", re.I)
