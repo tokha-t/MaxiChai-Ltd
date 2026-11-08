@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from cqa.checklist import OFFICIAL_IDS, ensure_defaults, load_default, validate_checklist, value_label
+from cqa.checklist import OFFICIAL_IDS, ensure_defaults, load_default, scale_steps, validate_checklist, value_label
 from cqa.config import ROOT, settings
 from cqa.dataset import fetch_group, parse_plain_text, records_from_upload, save_cache
 from cqa.evaluator import evaluate_many, rescore, review_appeal
@@ -295,7 +295,7 @@ def conversation(cid: str):
         "facts": compute_facts(conv, threshold_sec=int(cl.get("first_response_threshold_sec") or 180)),
         "evaluation": final_view(ev),
         "history": store.evaluation_history(cid),
-        "appeals": store.list_appeals(conversation_id=cid),
+        "appeals": [_appeal_full(a) for a in store.list_appeals(conversation_id=cid)],
     }
 
 
@@ -506,6 +506,23 @@ def appeal_ai_review(appeal_id: int):
 @app.post("/api/appeals/{appeal_id}/decision")
 def appeal_decide(appeal_id: int, body: Dict[str, Any] = Body(...)):
     """{"decision": "confirmed" | "changed", "value": <true|false|null|число>, "reason": "...", "reviewer": "..."}"""
+    if body.get("decision") == "changed":
+        ap = store.get_appeal(appeal_id)
+        if not ap:
+            _err(404, "Апелляция не найдена")
+        ev = store.get_evaluation(ap["evaluation_id"])
+        criterion = next((c for c in _checklist_for(ev)["criteria"] if c["id"] == ap["criterion_id"]), None)
+        if not criterion or "value" not in body:
+            _err(400, "Выберите новое значение критерия")
+        value = body["value"]
+        if value is None:
+            valid = criterion["type"] != "flag" and criterion.get("na_allowed", False)
+        elif criterion["type"] == "scale":
+            valid = type(value) in (int, float) and value in scale_steps(criterion)
+        else:
+            valid = type(value) is bool
+        if not valid:
+            _err(400, "Значение не входит в допустимые варианты критерия")
     try:
         ap = store.decide_appeal(appeal_id, body.get("decision"), body.get("value"), body.get("reason") or "",
                                  body.get("reviewer") or "проверяющий")
