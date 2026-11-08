@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -574,14 +575,21 @@ def results_save(body: Dict[str, Any] = Body(...)):
     doc = build_results(results, ids, model_name=" + ".join(used) if used else client.model, mode=settings.model_mode,
                         criteria_order=OFFICIAL_IDS)
     path = ROOT / "results" / target / "results.json"
-    write_results(doc, str(path))
     turn_counts = {}
     for cid in ids:
         conv = store.get_conversation(cid)
         turn_counts[cid] = len(conv.get("transcript") or []) if conv else 0
-    errors, warnings = validate_file(str(path), ids, turn_counts, 10 if target == "prod" else None)
+    # сначала пишем во временный файл рядом и проверяем; прежний results.json заменяется только проверенным
+    tmp = path.with_name(".results.json.tmp")
+    write_results(doc, str(tmp))
+    errors, warnings = validate_file(str(tmp), ids, turn_counts, 10 if target == "prod" else None)
+    saved = not errors
+    if saved:
+        os.replace(tmp, path)
+    else:
+        tmp.unlink(missing_ok=True)
     ok = sum(1 for r in doc["results"] if r["status"] == "ok")
-    return {"path": str(path.relative_to(ROOT)), "count": len(doc["results"]), "ok": ok,
+    return {"path": str(path.relative_to(ROOT)), "saved": saved, "count": len(doc["results"]), "ok": ok,
             "not_evaluated": len(ids) - len(results), "errors": errors, "warnings": warnings}
 
 

@@ -270,7 +270,7 @@ function renderApply(root, groups, current) {
 
 function diffHtml(diff) {
   if (!diff.length) return `<div class="muted small">Нет оценок прошлой версии для сравнения.</div>`;
-  const changed = diff.filter((d) => d.before !== d.after || d.changed.length);
+  const changed = diff.filter((d) => d.before !== d.after || d.changed.some((c) => c.before !== c.after));
   diff = [...changed, ...diff.filter((d) => !changed.includes(d))];
   return `<h3 style="margin-top:8px">Что изменилось: ${changed.length} из ${diff.length} диалогов</h3>
     <table class="grid small"><tr><th>Диалог</th><th>Итог до</th><th>Итог после</th><th>Изменённые критерии</th></tr>

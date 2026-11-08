@@ -32,10 +32,11 @@ export async function renderAppeals(root, params = [], query = null, alive = () 
   root.innerHTML = `
     <div class="page-head">
       <h1>Апелляции</h1>
-      <div class="tabs"><button data-tab="open" class="${selectedTab === "open" ? "active" : ""}">Открытые</button><button data-tab="reviewed" class="${selectedTab === "reviewed" ? "active" : ""}">Рассмотренные</button></div>
+      <div class="tabs" aria-label="Состояние апелляций"><button data-tab="open" aria-pressed="${selectedTab === "open"}" class="${selectedTab === "open" ? "active" : ""}">Открытые</button><button data-tab="reviewed" aria-pressed="${selectedTab === "reviewed"}" class="${selectedTab === "reviewed" ? "active" : ""}">Рассмотренные</button></div>
       <span class="spacer"></span>
-      ${state.role !== "reviewer" ? `<span class="pill warn">Решения принимает роль «Проверяющий» — переключите в шапке</span>` : `<span class="pill yes">Вы — проверяющий</span>`}
+      <button class="btn" data-refresh>Обновить список</button>
     </div>
+    <p class="muted">После подачи апелляции решение принимает проверяющий. Второе мнение ИИ — рекомендация, оно не закрывает апелляцию. Срок ответа не указан.</p>
     <div class="card">${list.length ? list.map(appealHtml).join("") : `<div class="empty">${selectedTab === "open" ? "Открытых апелляций нет. Оператор может оспорить критерий в карточке диалога." : "Рассмотренных апелляций пока нет."}</div>`}</div>`;
 
   const refresh = async () => {
@@ -47,6 +48,7 @@ export async function renderAppeals(root, params = [], query = null, alive = () 
     tab = b.dataset.tab;
     refresh();
   }));
+  root.querySelector("[data-refresh]").addEventListener("click", refresh);
 
   // Обновляем только второе мнение: поля решения и фокус остаются на месте.
   const pending = new Set(list.filter((a) => a.status === "open" && !a.ai_review).map((a) => a.id));
@@ -125,11 +127,23 @@ export async function renderAppeals(root, params = [], query = null, alive = () 
 
 function aiReviewHtml(a) {
   const ai = a.ai_review;
-  return `${ai ? (ai.error ? `<span class="muted small">Второе мнение ИИ недоступно: ${esc(ai.error)}</span>` :
-    `<div class="row"><b>Второе мнение ИИ:</b> ${ai.recommendation === "change" ? `<span class="pill warn">изменить на «${esc(ai.suggested_label)}»</span>` : `<span class="pill yes">оставить оценку</span>`}</div>
-    <div style="margin-top:4px">${esc(ai.rationale || "")}</div><div class="muted small">${esc(ai.model || "")}</div>`)
-    : `<span class="muted small">Второе мнение ИИ готовится…</span>`}
-    ${a.status === "open" ? ` <button class="btn small ghost" data-reai="${a.id}">↻ Запросить заново</button>` : ""}`;
+  const recommendation = ai?.recommendation === "change" ? `изменить на «${ai.suggested_label ?? "значение не указано"}»`
+    : ai?.recommendation === "keep" ? "оставить оценку" : "не сформирована";
+  return `${ai ? (ai.error ? `<p class="muted">Второе мнение ИИ недоступно. Можно повторить запрос; решение проверяющего ещё не принято.</p>` :
+    `<div class="ai-recommendation"><b>Рекомендация ИИ: ${esc(recommendation)}</b>
+    <p>${esc(ai.rationale || "Обоснование не получено.")}</p>
+    ${ai.model ? `<details><summary>Технические сведения рекомендации</summary><span class="muted small">Модель: ${esc(ai.model)}</span></details>` : ""}</div>`)
+    : `<p class="muted">Второе мнение ИИ готовится… Это не решение по апелляции.</p>`}
+    ${a.status === "open" ? ` <button class="btn" data-reai="${a.id}" aria-label="Повторить запрос второго мнения для ${esc(a.criterion?.name || a.criterion_id)}">Запросить второе мнение заново</button>` : ""}`;
+}
+
+function appealTimeline(a) {
+  const submitted = a.created_at ? `<time datetime="${esc(a.created_at)}">${esc(fmtDate(a.created_at))}</time>` : "Дата подачи не указана";
+  const decided = a.decided_at ? `<time datetime="${esc(a.decided_at)}">${esc(fmtDate(a.decided_at))}</time>` : "Дата решения не указана";
+  const result = a.status === "changed" ? "Оценка изменена" : a.status === "confirmed" ? "Оценка подтверждена" : "Статус решения не указан";
+  return `<ol class="appeal-timeline"><li><b>Апелляция подана</b><span>${submitted}${a.author ? ` · ${esc(a.author)}` : ""}</span></li>
+    <li ${a.status === "open" ? 'aria-current="step"' : ""}><b>${a.status === "open" ? "Ожидает решения проверяющего" : result}</b>
+    <span>${a.status === "open" ? "Назначение проверяющего не отображается. Срок ответа не указан." : `${decided}${a.reviewer ? ` · ${esc(a.reviewer)}` : ""}`}</span></li></ol>`;
 }
 
 function appealHtml(a) {
@@ -138,14 +152,14 @@ function appealHtml(a) {
   const evidence = new Set(orig.evidence_turns || []);
   const ai = a.ai_review;
   const opts = valueOptions(c);
-  const statusPill = a.status === "open" ? `<span class="pill info">на рассмотрении</span>` : a.status === "changed" ? `<span class="pill warn">оценка изменена</span>` : `<span class="pill yes">оценка подтверждена</span>`;
-  return `<div class="appeal">
-    <div class="row">
+  const statusPill = a.status === "open" ? `<span class="pill info">Ожидает решения проверяющего</span>` : a.status === "changed" ? `<span class="pill warn">Оценка изменена</span>` : `<span class="pill yes">Оценка подтверждена</span>`;
+  return `<article class="appeal" aria-labelledby="appeal-title-${a.id}">
+    <div class="row appeal-heading">
       ${statusPill}
-      <b>${esc(c.name || a.criterion_id)}</b>
+      <h2 id="appeal-title-${a.id}">${esc(c.name || a.criterion_id)}</h2>
       <span class="muted">в диалоге</span> <a class="mono" href="#/dialog/${encodeURIComponent(a.conversation_id)}">${esc(a.conversation_id)}</a>
-      <span class="spacer"></span><span class="muted small">${esc(a.author || "")} · ${fmtDate(a.created_at)}</span>
     </div>
+    ${appealTimeline(a)}
     <div class="appeal-grid">
       <div class="stack">
         <div><span class="muted small">Оценка ИИ:</span> <b>${esc(a.original_label)}</b>
@@ -159,20 +173,21 @@ function appealHtml(a) {
           ${(a.fragment || []).map((t) => `<div class="turn ${esc(t.speaker)} ${evidence.has(t.n) ? "flash" : ""}"><div class="n">[${t.n}]</div><div><div class="who">${esc(SPEAKER[t.speaker] || t.speaker)}<span class="t">${esc(t.rel || "")}</span></div><div class="txt">${esc(t.text)}</div></div></div>`).join("") || `<div class="muted small">—</div>`}
         </div>
         ${a.status === "open" ? (state.role === "reviewer" ? `
-          <form class="decision stack" data-decide="${a.id}">
-            <div class="row">
+          <form class="decision stack" data-decide="${a.id}" aria-label="Решение по критерию ${esc(c.name || a.criterion_id)}">
+            <h3 class="human-decision-status">Решение проверяющего: ожидается</h3>
+            <fieldset><legend>Выберите решение</legend><div class="row">
               <label class="check"><input type="radio" name="decision" value="confirmed" checked> Подтвердить оценку</label>
-              <label class="check"><input type="radio" name="decision" value="changed"> Изменить на</label>
-              <select name="value" aria-label="Новое значение критерия" disabled>${opts.map((o) => `<option value='${esc(JSON.stringify(o.value))}' ${ai && ai.suggested_value === o.value ? "selected" : ""}>${esc(o.label)}</option>`).join("")}</select>
-            </div>
-            <input type="text" name="reason" required aria-label="Причина решения" placeholder="Причина решения (обязательно)">
-            <div class="row"><input type="text" name="reviewer" aria-label="Проверяющий" value="Проверяющий" style="width:160px"><span class="spacer"></span><button class="btn primary" type="submit">Сохранить решение</button></div>
-          </form>` : `<div class="muted small">Решение принимает проверяющий.</div>`)
-        : `<div class="decision"><b>Решение:</b> ${a.status === "changed" ? `«${esc(a.original_label)}» → «${esc(a.decision_label)}»` : `«${esc(a.original_label)}» — оценка подтверждена`}<br>
+              <label class="check"><input type="radio" name="decision" value="changed"> Изменить оценку</label>
+              <label class="field"><span>Новое значение критерия</span><select name="value" disabled>${opts.map((o) => `<option value='${esc(JSON.stringify(o.value))}' ${ai && ai.suggested_value === o.value ? "selected" : ""}>${esc(o.label)}</option>`).join("")}</select></label>
+            </div></fieldset>
+            <label class="field"><span>Причина решения (обязательно)</span><textarea name="reason" required rows="3"></textarea></label>
+            <div class="row"><label class="field"><span>Проверяющий</span><input type="text" name="reviewer" value="Проверяющий"></label><span class="spacer"></span><button class="btn primary" type="submit">Сохранить решение</button></div>
+          </form>` : `<div class="human-decision-status"><h3>Решение проверяющего: ожидается</h3><p class="muted">После решения здесь появятся результат и его причина.</p></div>`)
+        : `<div class="decision"><h3>Решение проверяющего</h3> ${a.status === "changed" ? `«${esc(a.original_label)}» → «${esc(a.decision_label)}»` : `«${esc(a.original_label)}» — оценка подтверждена`}<br>
             <span class="muted small">Причина: ${esc(a.decision_reason || "")} · ${esc(a.reviewer || "")} · ${fmtDate(a.decided_at)}</span></div>`}
       </div>
     </div>
-  </div>`;
+  </article>`;
 }
 
 export { renderAppeals as render };

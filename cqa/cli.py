@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -118,17 +119,22 @@ def cmd_evaluate(args) -> None:
         used = sorted({v.get("model") for r in results if r.get("status") == "ok" for c in r["criteria"] for v in c.get("votes") or [] if v.get("model")})
         doc = build_results(results, [r["conversation_id"] for r in records],
                             model_name=" + ".join(used) if used else client.model, mode=cfg.model_mode)
-        path = write_results(doc, args.out)
-        print(f"results.json → {path}")
+        # проверяем во временном файле рядом; прежний results.json заменяется только проверенным документом
+        target = Path(args.out)
+        tmp = target.with_name("." + target.name + ".tmp")
+        write_results(doc, str(tmp))
         turn_counts = {r["conversation_id"]: len(r["transcript"]) for r in records}
-        errors, warnings = validate_file(str(path), [r["conversation_id"] for r in records], turn_counts, args.expect)
+        errors, warnings = validate_file(str(tmp), [r["conversation_id"] for r in records], turn_counts, args.expect)
         for w in warnings:
             print("  предупреждение:", w)
         if errors:
-            print("ОШИБКИ ФОРМАТА:")
+            tmp.unlink(missing_ok=True)
+            print("ОШИБКИ ФОРМАТА (файл не записан, прежний не изменён):")
             for e in errors:
                 print("  -", e)
             sys.exit(1)
+        os.replace(tmp, target)
+        print(f"results.json → {target}")
         print("Формат проверен: ошибок нет.")
 
 

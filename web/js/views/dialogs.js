@@ -373,7 +373,7 @@ function saveModal(groups, selectedGroup = "") {
           const res = await api.post("/api/results/save", { group_id: b.querySelector("[data-g]").value, target: b.querySelector("[data-t]").value });
           const out = b.querySelector("[data-out]");
           out.innerHTML = res.errors.length
-            ? `<div class="errors"><b>Есть ошибки формата:</b><br>${res.errors.map(esc).join("<br>")}</div>`
+            ? `<div class="errors"><b>Есть ошибки формата — файл не сохранён, прежний results.json не изменён:</b><br>${res.errors.map(esc).join("<br>")}</div>`
             : `<div class="okbox">Сохранено: <b>${esc(res.path)}</b> — записей ${res.count}, оценено ${res.ok}${res.not_evaluated ? `, не оценено ${res.not_evaluated}` : ""}. Формат проверен.</div>`;
           if (res.warnings.length) out.innerHTML += `<div class="muted small" style="margin-top:6px">${res.warnings.map(esc).join("<br>")}</div>`;
           return true;

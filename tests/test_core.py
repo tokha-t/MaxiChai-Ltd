@@ -152,3 +152,38 @@ def test_validator_catches_errors():
     errors, _ = validate_results(bad, ["a"], expected_count=1)
     text = " ".join(errors)
     assert "повтор" in text and "8 критериев" in text and "status=error" in text and "Ожидалось записей" in text
+
+
+def test_reuse_requires_same_input_and_enough_votes():
+    client = JudgePanel([MockClient("mock:a"), MockClient("mock:b"), MockClient("mock:c")])
+    first = evaluate_conversation(RECORDS[0], CL, client, votes=1)
+    assert first["status"] == "ok" and first["input_hash"]
+    # больше голосов, чем было, — оценка заново, а не старый один голос под видом трёх
+    more = evaluate_conversation(RECORDS[0], CL, client, votes=3, previous=first)
+    assert more["usage"]["calls"] == 3
+    assert not any(r["reused"] for r in more["criteria"])
+    # меньше или столько же голосов — переиспользование
+    same = evaluate_conversation(RECORDS[0], CL, client, votes=1, previous=more)
+    assert same["usage"]["calls"] == 0
+    # тот же ID, другой текст — оценка заново
+    changed = json.loads(json.dumps(RECORDS[0]))
+    changed["transcript"][-1]["text"] += " (изменено)"
+    fresh = evaluate_conversation(changed, CL, client, votes=1, previous=first)
+    assert fresh["usage"]["calls"] == 1
+    assert fresh["input_hash"] != first["input_hash"]
+
+
+def test_reimport_with_changed_transcript_marks_old_evaluation_stale(tmp_path):
+    from cqa.store import Store
+    store = Store(tmp_path / "t.db")
+    rec = json.loads(json.dumps(RECORDS[0]))
+    store.upsert_conversations([rec], "G")
+    res = evaluate_conversation(rec, CL, MockClient(), votes=1)
+    store.save_evaluation(res, None)
+    assert store.latest_evaluation(rec["conversation_id"], ok_only=True) is not None
+    store.upsert_conversations([rec], "G")  # то же содержание — оценка остаётся актуальной
+    assert store.latest_evaluation(rec["conversation_id"], ok_only=True) is not None
+    rec2 = json.loads(json.dumps(rec))
+    rec2["transcript"][0]["text"] = "Другой диалог с тем же ID"
+    store.upsert_conversations([rec2], "G")
+    assert store.latest_evaluation(rec["conversation_id"], ok_only=True) is None

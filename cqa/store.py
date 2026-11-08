@@ -108,6 +108,13 @@ class Store:
     def upsert_conversations(self, records: List[Dict[str, Any]], group_id: str) -> int:
         with _lock:
             for r in records:
+                row = self.conn.execute("SELECT data_json FROM conversations WHERE id=?", (r["conversation_id"],)).fetchone()
+                if row:
+                    old = json.loads(row["data_json"])
+                    if (old.get("transcript"), old.get("channel")) != (r.get("transcript"), r.get("channel")):
+                        # тот же ID, другое содержание: прошлые оценки больше не относятся к этому входу
+                        self.conn.execute("UPDATE evaluations SET status='stale' WHERE conversation_id=? AND status='ok'",
+                                          (r["conversation_id"],))
                 self.conn.execute(
                     "INSERT INTO conversations(id, group_id, channel, language, data_json, imported_at) VALUES(?,?,?,?,?,?) "
                     "ON CONFLICT(id) DO UPDATE SET group_id=excluded.group_id, channel=excluded.channel, "

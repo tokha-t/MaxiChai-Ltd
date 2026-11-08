@@ -22,9 +22,11 @@ P_HOLD_START = re.compile(r"находится на удержании|placed on
 P_REC_PAUSE = re.compile(r"приостановлен|paused|тоқтатыл", re.I)
 P_REC_RESUME = re.compile(r"возобновлен|resumed|жалғастырыл", re.I)
 # Предупреждение об ожидании в реплике оператора
+# (оператор сам берёт паузу: «проверю», «уточню», «подождите»; просьба к клиенту «Проверьте раздел» — не предупреждение)
 P_WAIT = re.compile(
-    r"минут|секунд|подожд|ожида|провер|уточн|посмотр|одну секунду|one moment|a moment|let me check|please wait|hold on|bear with|"
-    r"күте тұр|күтіңіз|тексер|қарап|сәл",
+    r"минут|секунд|подожд|ожида|момент|провер(?:ю|им|яю|ка)\b|уточн(?:ю|им|яю)\b|посмотр(?:ю|им)\b|"
+    r"one moment|a moment|a minute|a second|let me check|let me look|i'll check|i will check|checking|please wait|hold on|bear with|"
+    r"күте тұр|күтіңіз|күте тұрыңыз|тексерем|тексерейін|тексеріп жатырмын|қарап жатырмын|қарап шығайын|қарайын|сәл күт",
     re.I,
 )
 KZ_LETTERS = set("әғқңөұүһіӘҒҚҢӨҰҮҺІ")

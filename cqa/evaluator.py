@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import statistics
 import time
 import zlib
@@ -141,6 +143,25 @@ def _batch_items(data: Dict[str, Any]) -> Dict[str, Any]:
     return items if isinstance(items, dict) else {}
 
 
+def input_hash(conv: Dict[str, Any]) -> str:
+    """Отпечаток входа: роли, тексты, метки времени и порядок реплик, канал."""
+    payload = [conv.get("channel") or ""] + [[t.get("speaker"), t.get("text"), t.get("timestamp")]
+                                            for t in (conv.get("transcript") or [])]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def _reusable(previous: Optional[Dict[str, Any]], client: Any, votes: int, in_hash: str) -> bool:
+    """Прошлую оценку можно переиспользовать, только если совпадают модель и вход, а голосов было не меньше."""
+    if not previous or previous.get("status") != "ok":
+        return False
+    if previous.get("model") != getattr(client, "model", None):
+        return False
+    if int(previous.get("votes") or 0) < votes:
+        return False
+    prev_hash = previous.get("input_hash")
+    return prev_hash is None or prev_hash == in_hash
+
+
 def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], client: Any,
                           votes: Optional[int] = None, previous: Optional[Dict[str, Any]] = None,
                           force: Optional[List[str]] = None, mode: Optional[str] = None) -> Dict[str, Any]:
@@ -152,8 +173,8 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
     turns = build_turns(conv)
     facts = compute_facts(conv, threshold_sec=int(checklist.get("first_response_threshold_sec") or 180))
     facts_text = facts_to_text(facts)
-    same_model = bool(previous) and previous.get("model") == getattr(client, "model", None)
-    prev_rows = {r["criterion_id"]: r for r in previous.get("criteria", [])} if same_model and previous.get("status") == "ok" else {}
+    in_hash = input_hash(conv)
+    prev_rows = {r["criterion_id"]: r for r in previous.get("criteria", [])} if _reusable(previous, client, votes, in_hash) else {}
     force = set(force or [])
 
     pool = llm_pool()
@@ -238,6 +259,7 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
         "checklist_id": checklist.get("_id"),
         "model": getattr(client, "model", "unknown"),
         "votes": votes,
+        "input_hash": in_hash,
         "llm_mode": mode,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "facts": facts,
