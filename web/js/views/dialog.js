@@ -1,6 +1,8 @@
 // Карточка диалога: транскрипт, оценка с обоснованиями и переходом к репликам, апелляции, переоценка.
 import { api } from "../api.js";
-import { SPEAKER, channelIcon, errorToast, esc, fmtDate, fmtMoney, fmtScore, h, icon, jobBox, modal, notifyJobStarted, pollJob, scoreClass, state, toast, valuePill } from "../ui.js";
+import { SPEAKER, channelIcon, errorToast, esc, fmtDate, fmtMoney, fmtScore, h, icon, jobBox, modal, notifyJobStarted, pollJob, scoreClass, state, toast, valuePill, profileOptions } from "../ui.js";
+import { checksSummary, profileId, selectedProfile } from "../evaluation-meta.js";
+import { audioSource } from "../audio-source.js";
 
 const runningJobs = new Map();
 let renderVersion = 0;
@@ -9,14 +11,18 @@ export async function renderDialog(root, params = [], query = null, alive = () =
   const version = ++renderVersion;
   const isCurrent = () => alive() && version === renderVersion;
   const cid = params[0];
-  const [data, activeChecklist] = await Promise.all([
+  const [data, activeChecklist, profiles] = await Promise.all([
     api.get(`/api/conversations/${encodeURIComponent(cid)}`),
     api.get("/api/checklists/active").catch(() => null),
+    state.role === "reviewer" ? api.get("/api/checklists") : [],
   ]);
   if (!isCurrent()) return;
   const { conversation: conv, turns, facts, evaluation: ev, history: hist, appeals } = data;
+  if (query?.get("checklist_id")) state.evaluationChecklistId = profileId(query.get("checklist_id"));
   const isCall = (conv.channel || "").toLowerCase().includes("call");
-  const audioUrl = safeAudioUrl(conv.audio_url);
+  const audio = audioSource(conv.audio_url, location.href);
+  const audioUrl = audio?.url;
+  const nativeAudio = isCall && audio?.mode === "native";
   const ok = ev && ev.status === "ok";
   const finalRows = ok ? ev.final.criteria : [];
   const finalScore = ok ? ev.final.score : null;
@@ -51,14 +57,15 @@ export async function renderDialog(root, params = [], query = null, alive = () =
     <div class="dialog-layout">
       <section class="stack dialog-score" id="evalCol" aria-labelledby="dialog-score-title">
         ${ok ? evaluationHtml(ev, finalScore, finalRows, appealsByCrit) : ev && ev.status === "error"
-          ? `<div class="card card-pad" role="status"><h2 id="dialog-score-title">Оценка не удалась</h2><p class="muted">Не удалось получить результат оценки. Проверяющий может повторить запуск в служебных действиях.</p><p>Нового результата нет. Предыдущие оценки доступны в истории.</p></div>`
+          ? `<div class="card card-pad" role="status"><h2 id="dialog-score-title">Оценка не удалась</h2><p class="muted">Не удалось получить результат оценки. Проверяющий может повторить запуск в служебных действиях.</p><p>${esc(checksSummary(ev).text)}. Неполученные обязательные значения не заменены оценками.</p><p>Нового результата нет. Предыдущие оценки доступны в истории.</p></div>`
           : `<div class="card card-pad"><h2 id="dialog-score-title">Нет оценки</h2><p>Диалог ещё не оценён.${state.role === "reviewer" ? " Запустите оценку в служебных действиях ниже." : " Запуск оценки доступен проверяющему."}</p></div>`}
         ${appealsHtml(appeals || [])}
         ${factsHtml(facts)}
         ${historyHtml(hist || [])}
         ${ok ? technicalHtml(ev) : ""}
         ${state.role === "reviewer" ? `<details class="card card-pad dialog-service"><summary>Служебные действия</summary>
-          <h2>Запуск оценки</h2><p class="muted">Новый анализ этого диалога по активной версии правил. Предыдущая оценка сохранится в истории.</p>
+          <h2>Запуск оценки</h2><p class="muted">Новый анализ этого диалога по выбранной сохранённой версии правил. Предыдущая оценка сохранится в истории.</p>
+          <label class="field"><span>Сохранённый профиль</span><select data-profile>${profileOptions(profiles, state.evaluationChecklistId)}</select></label>
           <div class="row"><label class="field"><span>Число проверок</span><select data-votes><option value="1">Одна проверка</option><option value="3">Три проверки</option></select></label>
           <button class="btn primary" data-act="reeval">${icon("refresh")}${ok ? "Переоценить диалог" : "Оценить диалог"}</button></div>
           <p class="muted small">Несколько проверок помогают увидеть расхождения между ответами моделей. Время и стоимость зависят от моделей и числа проверок; согласие не означает вероятность правильности.</p>
@@ -68,12 +75,12 @@ export async function renderDialog(root, params = [], query = null, alive = () =
         <div class="transcript-head">
           <div class="row"><h2 id="dialog-transcript-title">Транскрипт</h2><span class="muted small">${turns.length} реплик</span></div>
           <button class="btn dialog-return" data-return-criterion hidden>Вернуться к критерию</button>
-          ${isCall ? `<div class="call-context">${audioUrl ? `<audio controls preload="none" src="${esc(audioUrl)}" id="player" aria-label="Запись звонка"></audio>
+          ${isCall ? `<div class="call-context">${audio?.mode === "external" ? `<a class="btn" href="${esc(audioUrl)}" target="_blank" rel="noopener">Открыть запись во внешнем плеере</a><p class="small muted">Запись открывается в отдельной вкладке. Перемотка по репликам здесь недоступна; клик выделяет текст реплики.</p>` : audioUrl ? `<audio controls preload="none" src="${esc(audioUrl)}" id="player" aria-label="Запись звонка"></audio>
             <p class="small" id="audio-status" role="status" hidden></p>
             <div class="small muted">Клик по реплике перематывает запись. Если плеер не играет — <a href="${esc(audioUrl)}" target="_blank" rel="noopener">Открыть запись</a>.</div>` : `<div class="small muted">Запись недоступна.</div>`}
             <p class="small muted">Транскрипт звонка распознан автоматически; удержание и паузы записи отмечены.</p></div>` : ""}
         </div>
-        <div class="turns">${turns.map((t) => segmentHtml(t.n, holdRanges, recordingGaps) + turnHtml(t, inHold(t.n), evidenceSet.has(t.n), isCall)).join("") || `<div class="empty">В диалоге пока нет реплик.</div>`}</div>
+        <div class="turns">${turns.map((t) => segmentHtml(t.n, holdRanges, recordingGaps) + turnHtml(t, inHold(t.n), evidenceSet.has(t.n), nativeAudio)).join("") || `<div class="empty">В диалоге пока нет реплик.</div>`}</div>
       </section>
     </div>`;
 
@@ -182,6 +189,17 @@ export async function renderDialog(root, params = [], query = null, alive = () =
 
   // Одно наблюдение за серверной задачей на диалог, даже после смены роли/экрана.
   const votesSel = root.querySelector("[data-votes]");
+  const profileSel = root.querySelector("[data-profile]");
+  profileSel?.addEventListener("change", () => {
+    state.evaluationChecklistId = profileId(profileSel.value);
+    const url = new URL(location.href);
+    const [path, raw = ""] = url.hash.split("?");
+    const search = new URLSearchParams(raw);
+    if (state.evaluationChecklistId) search.set("checklist_id", String(state.evaluationChecklistId));
+    else search.delete("checklist_id");
+    url.hash = path + (search.size ? `?${search}` : "");
+    window.history.replaceState(null, "", url);
+  });
   const evalButton = root.querySelector('[data-act="reeval"]');
   const clearJobQuery = () => {
     if (!isCurrent()) return;
@@ -195,6 +213,7 @@ export async function renderDialog(root, params = [], query = null, alive = () =
   const observe = async (task) => {
     if (evalButton) evalButton.disabled = true;
     if (votesSel) votesSel.disabled = true;
+    if (profileSel) profileSel.disabled = true;
     task.onTick = (job) => {
       if (isCurrent()) root.querySelector("#jobArea").innerHTML = jobBox(job, "Оценка диалога");
     };
@@ -206,6 +225,7 @@ export async function renderDialog(root, params = [], query = null, alive = () =
       clearJobQuery();
       const err = (job.results || []).find((r) => r.status !== "ok");
       if (job.status === "failed" || err) toast("Не удалось завершить оценку. Проверьте сохранённые настройки моделей и повторите запуск.", "error");
+      else if ((job.results || []).some((r) => checksSummary(r, job.votes).incomplete)) toast("Оценка сохранена с неполным числом проверок. Проверьте причины в карточке.", "error");
       else toast(`Оценено · ${fmtMoney(job.cost_usd)} · ${job.elapsed_sec} с`, "ok");
       await reload();
     } catch (err) {
@@ -215,15 +235,19 @@ export async function renderDialog(root, params = [], query = null, alive = () =
         errorToast(err);
         if (evalButton) evalButton.disabled = false;
         if (votesSel) votesSel.disabled = false;
+        if (profileSel) profileSel.disabled = false;
       }
     }
   };
   evalButton?.addEventListener("click", () => {
     if (!isCurrent() || runningJobs.has(cid)) return;
+    const profile = selectedProfile(profiles, profileSel.value);
+    if (!profile) { errorToast(new Error("Выберите сохранённый профиль правил")); return; }
+    const requestedVotes = Number(votesSel.value);
     const task = trackJob(cid, async () => {
       const jobs = await api.get("/api/jobs");
       if (jobs.some((job) => job.status === "running")) throw new Error("Оценка уже выполняется. Дождитесь завершения текущей задачи.");
-      const result = await api.post("/api/evaluate", { conversation_ids: [cid], votes: Number(votesSel.value), reuse: false });
+      const result = await api.post("/api/evaluate", { conversation_ids: [cid], checklist_id: profile.id, votes: requestedVotes, reuse: false });
       notifyJobStarted();
       return result;
     });
@@ -247,14 +271,6 @@ function trackJob(cid, start) {
     });
   })();
   return task;
-}
-
-function safeAudioUrl(raw) {
-  if (!raw || typeof raw !== "string") return null;
-  try {
-    const url = new URL(raw, location.href);
-    return ["http:", "https:"].includes(url.protocol) ? url.href : null;
-  } catch { return null; }
 }
 
 function segmentHtml(n, holds, gaps) {
@@ -312,9 +328,11 @@ function evaluationHtml(ev, score, rows, appealsByCrit) {
   const originals = new Map((ev.criteria || []).map((r) => [r.criterion_id, r]));
   const sectionNames = new Map((score.sections || []).map((section) => [section.id, section.name]));
   const formula = Number.isFinite(score.earned) && Number.isFinite(score.applicable_weight) && score.applicable_weight > 0 && Number.isFinite(score.final_score);
+  const checks = checksSummary(ev);
   return `
     <section class="card card-pad score-summary" aria-labelledby="dialog-score-title">
       <h2 id="dialog-score-title">Итоговая оценка</h2>
+      ${checks.incomplete ? `<div class="notice" role="status"><b>${esc(checks.text)}</b><p>Проверки получены не по всем критериям в запрошенном количестве. Итог сохранён; критерии требуют проверки.</p></div>` : ""}
       <div class="score-hero"><div class="score-big ${scoreClass(score.final_score)}">${fmtScore(score.final_score)}<small> / 100</small></div>
         <div>${changed ? `<span class="pill info">После апелляции</span><p>Исходная оценка ИИ: <span class="score">${fmtScore(aiScore)}</span></p>` : `<span class="muted">${score.final_score == null ? "Нет применимых критериев с баллами" : "По применимым критериям"}</span>`}</div>
       </div>
@@ -331,7 +349,7 @@ function evaluationHtml(ev, score, rows, appealsByCrit) {
       ${critical.map((row) => `<p>${esc(currentRationale(row, appealsByCrit[row.criterion_id]))}</p><div class="criterion-evidence">${evidenceButtons(row.evidence_turns, row.criterion_id)}</div>`).join("") || `<p>В оценке отмечена грубая ошибка; подробности не переданы.</p>`}
       <p class="small">Это отдельный признак, без числового штрафа к показанному итогу.</p></section>` : ""}
     <section class="criteria-section" aria-labelledby="criteria-title"><h2 id="criteria-title">Оценка по критериям</h2>
-      <div class="card">${rows.map((row) => criterionHtml(row, appealsByCrit[row.criterion_id] || [], originals.get(row.criterion_id), sectionNames.get(row.section) || row.section)).join("")}</div>
+      <div class="card">${rows.map((row) => criterionHtml(row, appealsByCrit[row.criterion_id] || [], originals.get(row.criterion_id), sectionNames.get(row.section) || row.section, ev.requested_votes ?? ev.votes)).join("")}</div>
     </section>
     <details class="card card-pad calculation-details"><summary>Как рассчитан итог</summary>
       <h2>Расчёт и разделы оценки</h2>
@@ -343,16 +361,18 @@ function evaluationHtml(ev, score, rows, appealsByCrit) {
     </details>`;
 }
 
-function criterionHtml(row, appeals, original, sectionName) {
+function criterionHtml(row, appeals, original, sectionName, requestedVotes) {
   const open = appeals.find((appeal) => appeal.status === "open");
   const decided = appeals.filter((appeal) => appeal.status !== "open");
   const isFlag = row.type === "flag";
   const evidenceLabel = row.value == null ? "Почему не применяется" : row.value === false || (row.type === "scale" && row.points < row.max_points) ? "Проверенный участок" : isFlag && row.value ? "Нарушение" : "Доказательства";
   const checks = row.votes || [];
-  const agreement = checks.length > 1 && Number.isFinite(row.agreement) ? `${Math.round(row.agreement * checks.length)} из ${checks.length} проверок дали согласованный результат.` : checks.length === 1 ? "Выполнена одна проверка." : "Число проверок не указано.";
+  const completeness = checksSummary(row, requestedVotes);
+  const agreement = completeness.valid > 0 && Number.isFinite(row.agreement) ? `${Math.round(row.agreement * completeness.valid)} из ${completeness.valid} валидных ответов согласованы.` : "Число согласованных валидных ответов не сохранено.";
   return `<article class="criterion" data-criterion-id="${esc(row.criterion_id)}">
     <div class="criterion-main"><h3 class="title" tabindex="-1">${esc(row.name)}</h3>
       <div class="criterion-result">${displayValue(row)}${row.needs_review ? `<span class="pill warn">Требует проверки</span>` : ""}${row.overridden ? `<span class="pill info">Изменено проверяющим</span>` : ""}</div>
+      ${completeness.incomplete ? `<p class="notice">${esc(row.review_reason || completeness.text)}. Режим проверок выполнен не полностью.</p>` : ""}
       <p class="rationale">${esc(currentRationale(row, appeals))}</p>
       <div class="criterion-evidence"><span class="muted small">${evidenceLabel}:</span>${evidenceButtons(row.evidence_turns, row.criterion_id) || `<span class="muted">Реплики не указаны</span>`}</div>
       ${row.overridden ? `<p class="override">ИИ: ${esc(original?.value_label ?? labelOf(row.ai_value))} → решение проверяющего: ${esc(row.value_label)}</p>` : ""}
@@ -364,7 +384,7 @@ function criterionHtml(row, appeals, original, sectionName) {
       ${row.overridden ? `<p><b>Исходное обоснование ИИ:</b> ${esc(original?.rationale || row.rationale || "Обоснование не передано.")}</p>` : ""}
       <dl class="kv"><dt>Раздел</dt><dd>${esc(sectionName)}</dd><dt>Результат</dt><dd>${esc(row.value_label ?? labelOf(row.value))}</dd>
         ${isFlag ? `<dt>Учёт в баллах</dt><dd>Отдельный признак; без числового штрафа</dd>` : `<dt>Баллы критерия</dt><dd class="score">${fmtScore(row.points)} из ${fmtScore(row.max_points)}</dd><dt>Исходный вес</dt><dd class="score">${fmtScore(row.weight)}</dd><dt>Вес после N/A</dt><dd class="score">${fmtScore(row.effective_weight)}</dd><dt>Вклад в итог из 100</dt><dd class="score">${fmtScore(row.score_contribution)}</dd>`}
-      </dl><p>${agreement} Согласие моделей не является измеренной вероятностью правильности.</p>
+      </dl><p>${esc(completeness.text)}.${completeness.received !== null ? ` Получено ответов всего: ${completeness.received}; не каждый ответ содержит допустимый вердикт.` : ""} ${agreement} Согласие моделей не является измеренной вероятностью правильности.</p>
       ${checks.length ? `<ul class="check-responses">${checks.map((vote, index) => `<li><b>Проверка ${index + 1}</b>${vote.model ? ` · ${esc(vote.model)}` : ""}: ${esc(vote.verdict || "—")}<p>${esc(vote.rationale || "Обоснование не передано.")}</p>${evidenceButtons(vote.evidence_turns, row.criterion_id)}</li>`).join("")}</ul>` : ""}
       ${decided.map((appeal) => `<p class="override">Апелляция: «${esc(appeal.comment || "")}» → ${appeal.status === "changed" ? "оценка изменена" : "оценка подтверждена"}${appeal.decision_reason ? ` · причина: ${esc(appeal.decision_reason)}` : ""}</p>`).join("")}
     </details>
@@ -373,12 +393,14 @@ function criterionHtml(row, appeals, original, sectionName) {
 
 function technicalHtml(ev) {
   const usage = ev.usage || {};
+  const checks = checksSummary(ev);
+  const models = ev.actual_models?.length ? ev.actual_models : [...new Set((ev.criteria || []).flatMap((row) => (row.votes || []).map((vote) => vote.model).filter(Boolean)))];
   return `<details class="card card-pad dialog-technical"><summary>Технические сведения</summary><h2>Происхождение оценки</h2>
-    <dl class="kv"><dt>Модели</dt><dd>${esc(ev.model || "Не указаны")}</dd><dt>Проверок</dt><dd>${ev.votes ?? "—"}</dd>
+    <dl class="kv"><dt>Фактические модели</dt><dd>${esc(models.join(" + ") || "Не сохранены")}</dd><dt>Проверки (минимум по критериям)</dt><dd>${esc(checks.text)}</dd>
       <dt>Вызовов модели</dt><dd>${usage.calls ?? "—"}</dd><dt>Время оценки</dt><dd>${usage.latency_sec ?? "—"} с</dd>
       <dt>Расчётная стоимость</dt><dd>${fmtMoney(usage.cost_usd)}</dd><dt>Токены вход / выход</dt><dd>${usage.prompt_tokens ?? "—"} / ${usage.completion_tokens ?? "—"}</dd>
       <dt>Версия чек-листа</dt><dd>v${ev.checklist_version ?? "—"}</dd><dt>Дата оценки</dt><dd>${fmtDate(ev.created_at)}</dd>
-    </dl><p class="small muted">Стоимость рассчитана по настройкам приложения и не является проверенным счётом провайдера.</p></details>`;
+    </dl><p class="small muted">Повторные ответы одной модели не являются независимыми моделями. Стоимость рассчитана по настройкам приложения и не является проверенным счётом провайдера.</p></details>`;
 }
 
 function labelOf(v) {

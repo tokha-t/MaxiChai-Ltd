@@ -1,15 +1,21 @@
 // Общие помощники интерфейса: экранирование, тосты, модалки, форматирование, опрос задач оценки.
 import { api } from "./api.js";
+import { checksSummary } from "./evaluation-meta.js";
 
 export const state = {
   role: "operator",
   embed: false,
   dialogFilters: { group_id: "", language: "", channel: "", critical: false, needs_review: false, q: "" },
   lastChecklistId: null,
+  evaluationChecklistId: null,
 };
 
 export function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+export function profileOptions(profiles, selectedId = null) {
+  return `<option value="">Выберите сохранённый профиль</option>` + profiles.map((profile) => `<option value="${esc(profile.id)}" ${String(profile.id) === String(selectedId) ? "selected" : ""}>v${esc(profile.version)} · ID ${esc(profile.id)} · ${esc(profile.name || "Чек-лист")}${profile.active ? " (активный)" : ""}</option>`).join("");
 }
 
 export function h(html) {
@@ -172,10 +178,11 @@ export async function pollJob(jobId, onTick) {
 export function jobBox(job, title = "Оценка") {
   const pct = job.total ? Math.round((job.done / job.total) * 100) : 0;
   const errs = (job.results || []).filter((r) => r.status !== "ok").length;
+  const incomplete = job.incomplete_count ?? (typeof job.incomplete === "number" ? job.incomplete : (job.results || []).filter((r) => checksSummary(r, job.votes).incomplete).length);
   const status = job.status === "running" ? "идёт" : job.status === "done" ? "готово" : "ошибка";
   return `<div class="progress">
     <div class="row"><b>${esc(title)}: ${status}</b><span class="spacer"></span>
-      <span class="small">${job.done}/${job.total} диалогов · вызовов модели ${job.llm_calls ?? 0} · ${job.elapsed_sec ?? 0} с · ${fmtMoney(job.cost_usd)}${errs ? ` · <span style="color:var(--danger)">ошибок ${errs}</span>` : ""}</span></div>
+      <span class="small">${job.done}/${job.total} диалогов · профиль v${esc(job.checklist_version ?? "—")} · запрошено проверок ${esc(job.votes ?? "—")} · вызовов модели ${job.llm_calls ?? 0} · ${job.elapsed_sec ?? 0} с · ${fmtMoney(job.cost_usd)}${errs ? ` · <span style="color:var(--danger)">ошибок ${errs}</span>` : ""}${incomplete ? ` · <span class="pill warn">Неполные проверки: ${incomplete}</span>` : ""}</span></div>
     <div class="bar" role="progressbar" aria-label="${esc(title)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div>
     ${job.error ? `<div class="small" role="alert">Оценка прервана. Проверьте настройки и повторите запрос.</div>` : ""}</div>`;
 }

@@ -1,7 +1,7 @@
 // Чистые преобразования полного списка: URL, сортировка и база расчёта.
 export const DIALOG_FILTER_DEFAULTS = Object.freeze({
   group_id: "", language: "", channel: "", q: "", critical: false, needs_review: false,
-  open_appeals: false, criterion_id: "", criterion_violation: false, sort: "date_desc",
+  open_appeals: false, criterion_id: "", criterion_violation: false, sort: "date_desc", checklist_id: "",
 });
 const SORTS = new Set(["score_asc", "score_desc", "date_asc", "date_desc"]);
 const BOOLS = new Set(["critical", "needs_review", "open_appeals", "criterion_violation"]);

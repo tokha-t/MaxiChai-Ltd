@@ -1,8 +1,8 @@
 """Командная строка.
 
   python -m cqa fetch --group DEV                  # скачать набор и загрузить в базу
-  python -m cqa evaluate --group DEV --out results/dev/results.json
-  python -m cqa evaluate --group <PROD_ID> --out results/prod/results.json --expect 10
+  python -m cqa evaluate --group DEV --checklist 1 --votes 1 --out results/dev/results.json
+  python -m cqa evaluate --group <PROD_ID> --checklist <ID> --votes 3 --out results/prod/results.json --expect 10
   python -m cqa validate results/prod/results.json --group <PROD_ID> --expect 10
   python -m cqa show p1-ru-001                     # последняя оценка диалога в консоли
   python -m cqa judges | ping | models --provider gemini --filter flash
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import threading
 import time
@@ -21,60 +20,112 @@ from typing import Any, Dict, List
 
 from .checklist import ensure_defaults, load_default, load_file, validate_checklist
 from .config import ROOT, _judge, settings, with_judges
-from .dataset import get_group, records_from_upload, save_cache
+from .dataset import fetch_group, load_cache, records_from_upload, save_cache
 from .evaluator import evaluate_many
-from .export import build_results, has_mock_evaluations, write_results
+from . import export as result_export
+from .export import build_results, has_mock_evaluations
 from .llm import OpenAICompatibleClient, make_client
 from .store import Store
-from .validate import validate_file
+from .validate import validate_file, validate_results
 
 
 def _load_group(group: str, refresh: bool, url: str = None, file: str = None) -> List[Dict[str, Any]]:
     if file:  # набор выдали файлом
         records = records_from_upload(json.loads(Path(file).read_text(encoding="utf-8")), default_id=group.lower())
-        save_cache(group, {"dataset_group_id": group, "total_records": len(records), "records": records})
         return records
-    data = get_group(group, refresh=refresh, url=url)
+    data = None if refresh else load_cache(group)
+    if not data:
+        data = fetch_group(group, url=url)
     return data["records"]
 
 
+def _checklist_content(checklist: Dict[str, Any]) -> str:
+    def without_metadata(value):
+        if isinstance(value, dict):
+            return {k: without_metadata(v) for k, v in value.items() if not k.startswith("_")}
+        if isinstance(value, list):
+            return [without_metadata(v) for v in value]
+        return value
+
+    normalized = without_metadata(ensure_defaults(checklist))
+    normalized.pop("version", None)
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _pick_checklist(arg: str, store: Store) -> Dict[str, Any]:
-    if arg == "default":
-        cl = load_default()
-        db_default = next((c for c in store.list_checklists() if c["version"] == 1), None)
-        cl["_id"] = db_default["id"] if db_default else None
-        return cl
     if arg == "active":
-        return store.active_checklist()
-    cl = load_file(arg)
-    errors = validate_checklist(ensure_defaults(cl))
+        cl = store.active_checklist()
+        if not cl:
+            sys.exit("Активный чек-лист не найден")
+        return cl
+    if arg.isdecimal():
+        cl = store.get_checklist(int(arg))
+        if not cl:
+            sys.exit(f"Чек-лист с ID {arg} не найден")
+        return cl
+    cl = ensure_defaults(load_default() if arg == "default" else load_file(arg))
+    errors = validate_checklist(cl)
     if errors:
         sys.exit("Ошибки в чек-листе: " + "; ".join(errors))
-    return cl
+    content = _checklist_content(cl)
+    for saved in store.list_checklists():
+        snapshot = store.get_checklist(saved["id"])
+        if _checklist_content(snapshot) == content:
+            return snapshot
+    return store.save_checklist(cl, note="Снимок профиля CLI", activate=False)
+
+
+def _import_group(args, store: Store, refresh: bool) -> List[Dict[str, Any]]:
+    cached = load_cache(args.group)
+    try:
+        if cached and cached.get("records"):
+            store.register_dataset_manifest(cached["records"], args.group, source="cache")
+        records = _load_group(args.group, refresh=refresh, url=args.url, file=args.file)
+        source = "file" if args.file else ("organizer" if refresh or not cached else "cache")
+        store.register_dataset_manifest(records, args.group, source=source)
+    except ValueError as exc:
+        sys.exit(f"Набор не импортирован: {exc}")
+    save_cache(args.group, {"dataset_group_id": args.group, "total_records": len(records), "records": records})
+    store.upsert_conversations(records, args.group)
+    return records
+
+
+def _submission_target(path: Path) -> str:
+    # os.replace заменяет сам файл-ссылку: разрешаем ссылки только в каталоге.
+    destination = path.parent.resolve() / path.name
+    for directory in {(ROOT / "results").resolve(), Path("results").resolve()}:
+        if directory in destination.parents:
+            relative = destination.relative_to(directory)
+            if len(relative.parts) >= 2 and relative.parts[0] in ("dev", "prod"):
+                return relative.parts[0]
+            sys.exit("Для сдачи укажите путь внутри results/dev/ или results/prod/")
+    return ""
 
 
 def cmd_fetch(args) -> None:
-    records = _load_group(args.group, refresh=True, url=args.url, file=args.file)
     store = Store()
-    store.upsert_conversations(records, args.group)
+    records = _import_group(args, store, refresh=True)
     print(f"Загружено {len(records)} диалогов набора {args.group} в {settings.db_path}")
 
 
 def cmd_evaluate(args) -> None:
-    records = _load_group(args.group, refresh=args.refresh, url=args.url, file=args.file)
+    store = Store()
+    records = _import_group(args, store, refresh=args.refresh)
     if args.ids:
         wanted = set(x.strip() for x in args.ids.split(","))
         records = [r for r in records if r["conversation_id"] in wanted]
     if args.limit:
         records = records[: args.limit]
-    store = Store()
-    store.upsert_conversations(records, args.group)
     checklist = _pick_checklist(args.checklist, store)
+    profile_hash = result_export.checklist_fingerprint(checklist)
+    requested_votes = args.votes or settings.llm_votes
     cfg = with_judges(settings, args.judges) if args.judges else settings
     client = make_client(cfg)
     total = len(records)
-    print(f"Оцениваю {total} диалогов: судьи {client.model}; голосов {args.votes or settings.llm_votes}; "
-          f"режим {settings.llm_mode}; чек-лист «{checklist.get('name')}» v{checklist.get('version')}")
+    print(f"Группа {args.group}; профиль ID {checklist.get('_id')}, v{checklist.get('version')}, SHA-256 {profile_hash}; "
+          f"запрошено проверок: {requested_votes}")
+    print(f"Оцениваю {total} диалогов: настроенные судьи {client.model}; "
+          f"режим {settings.llm_mode}; чек-лист «{checklist.get('name')}»")
     dead = [j.model for j in client.judges if getattr(j, "dead_reason", None)]
     if dead:
         print("Пропущены судьи:", ", ".join(dead))
@@ -102,6 +153,10 @@ def cmd_evaluate(args) -> None:
         log.write(json.dumps({
             "conversation_id": res["conversation_id"], "status": res.get("status"), "error": res.get("error"),
             "model": res.get("model"), "checklist_version": res.get("checklist_version"), "votes": res.get("votes"),
+            "checklist_id": checklist.get("_id"), "checklist_hash": profile_hash,
+            "requested_votes": res.get("requested_votes", requested_votes),
+            "received_votes": res.get("received_votes"), "valid_votes": res.get("valid_votes"),
+            "votes_complete": res.get("votes_complete"), "actual_models": res.get("actual_models"),
             "score": score.get("final_score") if res.get("status") == "ok" else None,
             "critical_flag": score.get("critical_flag"), "usage": usage,
             "criteria": [{"id": r["criterion_id"], "value": r.get("value"), "agreement": r.get("agreement"),
@@ -109,36 +164,43 @@ def cmd_evaluate(args) -> None:
         }, ensure_ascii=False) + "\n")
         log.flush()
 
-    results = evaluate_many(records, checklist, client, votes=args.votes, parallel_dialogs=args.parallel, on_done=on_done)
-    log.close()
+    try:
+        results = evaluate_many(records, checklist, client, votes=requested_votes, parallel_dialogs=args.parallel, on_done=on_done)
+    finally:
+        log.close()
     elapsed = time.time() - started
     ok = sum(1 for r in results if r.get("status") == "ok")
+    incomplete = sum(1 for r in results if r.get("votes_complete") is not True)
+    used = sorted({v.get("model") for r in results for c in r.get("criteria") or []
+                   for v in c.get("votes") or [] if v.get("model")} |
+                  {m for r in results for m in r.get("actual_models") or []})
+    print(f"Обработано: {len(results)}; с ошибкой: {len(results) - ok}; "
+          f"неполных или неизвестных по числу проверок: {incomplete}; "
+          f"фактические модели ответов: {', '.join(used) or 'ответов нет'}")
     print(f"Готово: {ok}/{total} без ошибок за {elapsed:.0f} с, стоимость ≈ ${done['cost']:.3f} "
           f"(≈ ${done['cost'] / max(1, total):.4f} за диалог). Журнал: {log_path}")
     if args.out:
         target = Path(args.out)
-        submission_dirs = {(ROOT / "results").resolve(), Path("results").resolve()}
-        # os.replace заменяет сам файл-ссылку, поэтому разрешаем ссылки только в каталоге.
-        destination = target.parent.resolve() / target.name
-        if any(directory in destination.parents for directory in submission_dirs) and has_mock_evaluations(results):
+        submission_target = _submission_target(target)
+        if submission_target and has_mock_evaluations(results):
             sys.exit("в выгрузке есть оценки заглушки")
-        used = sorted({v.get("model") for r in results if r.get("status") == "ok" for c in r["criteria"] for v in c.get("votes") or [] if v.get("model")})
-        doc = build_results(results, [r["conversation_id"] for r in records],
-                            model_name=" + ".join(used) if used else client.model, mode=cfg.model_mode)
-        # проверяем во временном файле рядом; прежний results.json заменяется только проверенным документом
-        tmp = target.with_name("." + target.name + ".tmp")
-        write_results(doc, str(tmp))
-        turn_counts = {r["conversation_id"]: len(r["transcript"]) for r in records}
-        errors, warnings = validate_file(str(tmp), [r["conversation_id"] for r in records], turn_counts, args.expect)
+        if submission_target:
+            doc, errors, warnings = result_export.prepare_submission(
+                results, records, checklist, store.get_dataset_manifest(args.group), submission_target, args.group,
+            )
+        else:
+            doc = build_results(results, [r["conversation_id"] for r in records],
+                                model_name=" + ".join(used) if used else client.model, mode=cfg.model_mode)
+            turn_counts = {r["conversation_id"]: len(r["transcript"]) for r in records}
+            errors, warnings = validate_results(doc, [r["conversation_id"] for r in records], turn_counts, args.expect)
         for w in warnings:
             print("  предупреждение:", w)
         if errors:
-            tmp.unlink(missing_ok=True)
             print("ОШИБКИ ФОРМАТА (файл не записан, прежний не изменён):")
             for e in errors:
                 print("  -", e)
             sys.exit(1)
-        os.replace(tmp, target)
+        result_export.atomic_write_results(doc, str(target))
         print(f"results.json → {target}")
         print("Формат проверен: ошибок нет.")
 
@@ -280,7 +342,7 @@ def main(argv=None) -> None:
     e.add_argument("--limit", type=int)
     e.add_argument("--votes", type=int, help=f"голосов на критерий (по умолчанию {settings.llm_votes})")
     e.add_argument("--parallel", type=int, default=4, help="диалогов параллельно")
-    e.add_argument("--checklist", default="default", help="default | active | путь к JSON")
+    e.add_argument("--checklist", default="default", help="числовой ID версии | default | active | путь к JSON")
     e.add_argument("--expect", type=int, help="ожидаемое число записей (для prod — 10)")
     e.add_argument("--refresh", action="store_true", help="перекачать набор из API")
     e.add_argument("--url", help="другая ссылка API (без group_id), если организаторы дали новую")

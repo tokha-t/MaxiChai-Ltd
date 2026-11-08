@@ -1,6 +1,18 @@
 // Единственное место, где интерфейс ходит на сервер. База берётся из window.CQA_API_BASE (для встраивания в D365).
 const base = () => (window.CQA_API_BASE || "").replace(/\/$/, "");
 
+export function apiErrorMessage(data, status) {
+  const detail = data?.detail;
+  let msg = typeof detail === "string" ? detail
+    : Array.isArray(detail?.errors) && detail.errors.length ? detail.errors.join("\n")
+    : typeof detail?.message === "string" ? detail.message
+    : Array.isArray(detail) ? detail.map((item) => item.msg || "Неверные параметры запроса").join("\n")
+    : `Ошибка ${status}`;
+  if (status >= 500) msg = "Сервер не смог выполнить запрос. Попробуйте ещё раз.";
+  return msg.replace(/(api[_-]?key|authorization|token|secret)([\s"':=]+)[^\s,"'}]+/gi, "$1: [скрыто]")
+    .replace(/\b(?:AIza[\w-]{20,}|sk-[\w-]{16,})\b/g, "[ключ скрыт]");
+}
+
 async function request(method, path, body) {
   const opts = { method, headers: {} };
   if (body !== undefined) {
@@ -17,12 +29,10 @@ async function request(method, path, body) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!res.ok) {
-    let msg = `Ошибка ${res.status}`;
-    if (data && data.detail) msg = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
-    if (res.status >= 500) msg = 'Сервер не смог выполнить запрос. Попробуйте ещё раз.';
-    msg = msg.replace(/(api[_-]?key|authorization|token|secret)([\s"':=]+)[^\s,"'}]+/gi, '$1: [скрыто]')
-      .replace(/\b(?:AIza[\w-]{20,}|sk-[\w-]{16,})\b/g, '[ключ скрыт]');
-    throw new Error(msg);
+    const error = new Error(apiErrorMessage(data, res.status));
+    error.status = res.status;
+    error.jobId = data?.detail?.job_id;
+    throw error;
   }
   return data;
 }

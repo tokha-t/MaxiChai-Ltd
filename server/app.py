@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import os
 import threading
 import time
 import uuid
@@ -22,8 +21,8 @@ from cqa.checklist import OFFICIAL_IDS, ensure_defaults, load_default, scale_ste
 from cqa.config import ROOT, settings
 from cqa.dataset import fetch_group, parse_plain_text, records_from_upload, save_cache
 from cqa.evaluator import evaluate_many, rescore, review_appeal
-from cqa.export import build_results, has_mock_evaluations, write_results
-from cqa.validate import validate_file
+from cqa.export import (atomic_write_results, build_results, checklist_fingerprint, prepare_submission,
+                        _saved_model_info)
 from cqa.facts import build_turns, compute_facts
 from cqa.llm import make_client
 from cqa.store import Store
@@ -40,14 +39,15 @@ def _import_cached_groups() -> None:
     known = {g["group_id"] for g in store.groups()}
     for path in sorted(settings.data_dir.glob("*.json")):
         group = path.stem
-        if group in known:
-            continue
         try:
             import json as _json
             data = _json.loads(path.read_text(encoding="utf-8"))
             records = data.get("records") if isinstance(data, dict) else None
             if records:
-                store.upsert_conversations(records, group)
+                group = str(data.get("dataset_group_id") or group)
+                store.register_dataset_manifest(records, group, source="cache")
+                if group not in known:
+                    store.upsert_conversations(records, group)
         except Exception:  # noqa: BLE001 — битый кэш не должен ронять сервер
             continue
 
@@ -215,7 +215,11 @@ def dataset_fetch(body: Dict[str, Any] = Body(...)):
     try:
         data = fetch_group(group)
     except Exception as exc:  # noqa: BLE001
-        _err(502, f"Не удалось получить набор: {exc}")
+        _err(502, f"Не удалось получить набор ({type(exc).__name__})")
+    try:
+        store.register_dataset_manifest(data["records"], group, source="organizer")
+    except ValueError as exc:
+        _err(409, str(exc))
     save_cache(group, data)
     n = store.upsert_conversations(data["records"], group)
     return {"group_id": group, "count": n, "ids": [r["conversation_id"] for r in data["records"]]}
@@ -382,8 +386,12 @@ def _run_job(job_id: str, convs: List[Dict[str, Any]], checklist: Dict[str, Any]
             job["done"] += 1
             job["cost_usd"] += (res.get("usage") or {}).get("cost_usd") or 0
             job["llm_calls"] += (res.get("usage") or {}).get("calls") or 0
+            job["incomplete"] += int(res.get("votes_complete") is False)
             job["results"].append({"conversation_id": res["conversation_id"], "evaluation_id": eval_id,
                                    "status": res.get("status"), "error": res.get("error"),
+                                   "requested_votes": res.get("requested_votes"), "received_votes": res.get("received_votes"),
+                                   "valid_votes": res.get("valid_votes"), "votes_complete": res.get("votes_complete"),
+                                   "incomplete_criteria": res.get("incomplete_criteria") or [],
                                    "final_score": (res.get("score") or {}).get("final_score"),
                                    "critical_flag": (res.get("score") or {}).get("critical_flag")})
 
@@ -438,10 +446,11 @@ def evaluate(body: Dict[str, Any] = Body(...)):
                     "message": "Оценка этой группы или выбранных диалогов уже выполняется",
                     "job_id": current["job_id"],
                 })
-        JOBS[job_id] = {"job_id": job_id, "status": "running", "total": len(convs), "done": 0, "results": [],
+        JOBS[job_id] = {"job_id": job_id, "status": "running", "total": len(convs), "done": 0, "results": [], "incomplete": 0,
                         "cost_usd": 0.0, "llm_calls": 0, "started_at": time.time(), "finished_at": None, "error": None,
                         "group_id": group_id, "conversation_ids": list(ids), "votes": votes,
-                        "checklist_id": checklist.get("_id"), "checklist_version": checklist.get("version")}
+                        "checklist_id": checklist.get("_id"), "checklist_version": checklist.get("version"),
+                        "checklist_fingerprint": checklist_fingerprint(checklist)}
     try:
         threading.Thread(target=_run_job, args=(job_id, convs, checklist, votes, body.get("reuse", True),
                                                 body.get("force")), daemon=True).start()
@@ -587,59 +596,67 @@ def appeal_decide(appeal_id: int, body: Dict[str, Any] = Body(...)):
 
 
 # ---------------- выгрузка и аналитика ----------------
+def _prepare_official(group_id: str, target: str, checklist_id: Optional[int]):
+    records = [store.get_conversation(c["conversation_id"]) for c in store.list_conversations(group_id)]
+    checklist = store.get_checklist(checklist_id) if checklist_id else None
+    results = []
+    missing_warnings = []
+    if checklist:
+        for record in records:
+            cid = record["conversation_id"]
+            evaluation = store.latest_evaluation(cid, checklist_id=checklist_id)
+            if evaluation:
+                results.append(evaluation)
+            else:
+                other = store.latest_evaluation(cid)
+                if other:
+                    missing_warnings.append(f"{cid}: нет оценки профиля {checklist_id}; есть профиль {other.get('_checklist_id')}. Выгружается status=error")
+    doc, errors, warnings = prepare_submission(results, records, checklist, store.get_dataset_manifest(group_id),
+                                               target, group_id)
+    return doc, errors, missing_warnings + warnings, results, records
+
+
 @app.get("/api/export")
-def export(group_id: str, source: str = Query("ai", pattern="^(ai|final)$")):
-    """results.json по набору. source=ai — оценка системы (для сдачи); final — с учётом решений по апелляциям."""
+def export(group_id: str, source: str = Query("ai", pattern="^(ai|final)$"),
+           target: Optional[str] = None, checklist_id: Optional[int] = None):
+    """AI для сдачи: явный target + checklist_id. final — отдельный диагностический файл после апелляций."""
+    if source == "ai":
+        doc, errors, warnings, _, _ = _prepare_official(group_id, target, checklist_id)
+        if errors:
+            raise HTTPException(status_code=400, detail={"errors": errors, "warnings": warnings})
+        return JSONResponse(doc, headers={"Content-Disposition": 'attachment; filename="results.json"'})
     ids = [c["conversation_id"] for c in store.list_conversations(group_id)]
     results = []
     for cid in ids:
-        ev = final_view(store.latest_evaluation(cid))
+        ev = final_view(store.latest_evaluation(cid, checklist_id=checklist_id))
         if not ev:
             continue
         if source == "final" and ev.get("status") == "ok":
             ev = dict(ev, criteria=ev["final"]["criteria"], score=ev["final"]["score"])
         results.append(ev)
-    doc = build_results(results, ids, model_name=client.model, mode=settings.model_mode, criteria_order=OFFICIAL_IDS)
-    return JSONResponse(doc, headers={"Content-Disposition": f'attachment; filename="results_{group_id}.json"'})
+    name, mode, _, _ = _saved_model_info(results)
+    doc = build_results(results, ids, model_name=name or "unknown", mode=mode, criteria_order=OFFICIAL_IDS)
+    return JSONResponse(doc, headers={"Content-Disposition": 'attachment; filename="diagnostic_final_results.json"'})
 
 
 @app.post("/api/results/save")
 def results_save(body: Dict[str, Any] = Body(...)):
-    """{"group_id": "DEV", "target": "dev" | "prod"} → results/<target>/results.json (оценка системы) + проверка формата."""
+    """{group_id, target: dev|prod, checklist_id} → проверенный официальный AI-файл."""
     group = (body.get("group_id") or "").strip()
     target = (body.get("target") or "").strip()
     if target not in ("dev", "prod"):
         _err(400, "target: dev или prod")
-    ids = [c["conversation_id"] for c in store.list_conversations(group)]
-    if not ids:
-        _err(400, f"В группе {group!r} нет диалогов")
-    results = [r for r in (store.latest_evaluation(cid) for cid in ids) if r]
     path = ROOT / "results" / target / "results.json"
-    if has_mock_evaluations(results):
-        return {"path": str(path.relative_to(ROOT)), "saved": False, "count": len(ids),
-                "ok": sum(1 for r in results if r.get("status") == "ok"),
-                "not_evaluated": len(ids) - len(results),
-                "errors": ["в выгрузке есть оценки заглушки"], "warnings": []}
-    used = sorted({v.get("model") for r in results if r.get("status") == "ok" for c in r["criteria"]
-                   for v in c.get("votes") or [] if v.get("model")})
-    doc = build_results(results, ids, model_name=" + ".join(used) if used else client.model, mode=settings.model_mode,
-                        criteria_order=OFFICIAL_IDS)
-    turn_counts = {}
-    for cid in ids:
-        conv = store.get_conversation(cid)
-        turn_counts[cid] = len(conv.get("transcript") or []) if conv else 0
-    # сначала пишем во временный файл рядом и проверяем; прежний results.json заменяется только проверенным
-    tmp = path.with_name(".results.json.tmp")
-    write_results(doc, str(tmp))
-    errors, warnings = validate_file(str(tmp), ids, turn_counts, 10 if target == "prod" else None)
+    raw_id = body.get("checklist_id")
+    if raw_id is not None and (type(raw_id) is not int or raw_id <= 0):
+        _err(400, "checklist_id должен быть положительным целым ID сохранённого профиля")
+    doc, errors, warnings, results, records = _prepare_official(group, target, raw_id)
     saved = not errors
     if saved:
-        os.replace(tmp, path)
-    else:
-        tmp.unlink(missing_ok=True)
-    ok = sum(1 for r in doc["results"] if r["status"] == "ok")
-    return {"path": str(path.relative_to(ROOT)), "saved": saved, "count": len(doc["results"]), "ok": ok,
-            "not_evaluated": len(ids) - len(results), "errors": errors, "warnings": warnings}
+        atomic_write_results(doc, str(path))
+    return {"path": str(path.relative_to(ROOT)), "saved": saved, "count": len(records),
+            "ok": sum(1 for r in results if r.get("status") == "ok"),
+            "not_evaluated": len(records) - len(results), "errors": errors, "warnings": warnings}
 
 
 @app.get("/api/stats")

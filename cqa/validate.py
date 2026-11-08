@@ -35,7 +35,8 @@ def _value_ok(cid: str, value: Any) -> bool:
 
 
 def validate_results(doc: Any, expected_ids: Optional[List[str]] = None,
-                     turn_counts: Optional[Dict[str, int]] = None, expected_count: Optional[int] = None) -> Tuple[List[str], List[str]]:
+                     turn_counts: Optional[Dict[str, int]] = None, expected_count: Optional[int] = None,
+                     checklist: Optional[Dict[str, Any]] = None) -> Tuple[List[str], List[str]]:
     """Возвращает (ошибки, предупреждения)."""
     errors: List[str] = []
     warnings: List[str] = []
@@ -52,7 +53,7 @@ def validate_results(doc: Any, expected_ids: Optional[List[str]] = None,
     if not isinstance(results, list):
         return errors + ["results должен быть массивом"], warnings
 
-    checklist = ensure_defaults(load_default())
+    checklist = ensure_defaults(checklist if checklist is not None else load_default())
     seen = set()
     n_error = 0
     for i, r in enumerate(results, 1):
@@ -133,7 +134,7 @@ def validate_results(doc: Any, expected_ids: Optional[List[str]] = None,
 
 
 def validate_file(path: str, expected_ids: Optional[List[str]] = None, turn_counts: Optional[Dict[str, int]] = None,
-                  expected_count: Optional[int] = None) -> Tuple[List[str], List[str]]:
+                  expected_count: Optional[int] = None, checklist: Optional[Dict[str, Any]] = None) -> Tuple[List[str], List[str]]:
     p = Path(path)
     try:
         raw = p.read_bytes().decode("utf-8")
@@ -143,4 +144,4 @@ def validate_file(path: str, expected_ids: Optional[List[str]] = None, turn_coun
         doc = json.loads(raw, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(f"недопустимая константа {c}")))
     except ValueError as exc:
         return [f"Невалидный JSON: {exc}"], []
-    return validate_results(doc, expected_ids, turn_counts, expected_count)
+    return validate_results(doc, expected_ids, turn_counts, expected_count, checklist)

@@ -54,7 +54,21 @@ def _default_evidence(cid: str, facts: Dict[str, Any]) -> List[int]:
     return [1] if facts.get("n_turns") else []
 
 
-def aggregate_votes(c: Dict[str, Any], votes: List[LLMResult], facts: Dict[str, Any]) -> Dict[str, Any]:
+def _vote_metadata(c: Dict[str, Any], votes: List[Dict[str, Any]], requested: int) -> Dict[str, Any]:
+    valid = sum(1 for vote in votes if verdict_to_value(c, vote.get("verdict"))[1])
+    complete = valid >= requested
+    verb = "Получена" if valid % 10 == 1 and valid % 100 != 11 else "Получено"
+    noun = "проверки" if requested % 10 == 1 and requested % 100 != 11 else "проверок"
+    return {
+        "requested_votes": requested, "received_votes": len(votes), "valid_votes": valid,
+        "votes_complete": complete,
+        "review_reason": None if complete else f"{verb} {valid} из {requested} {noun}",
+        "actual_models": sorted({v["model"] for v in votes if v.get("model")}),
+    }
+
+
+def aggregate_votes(c: Dict[str, Any], votes: List[LLMResult], facts: Dict[str, Any],
+                    requested_votes: Optional[int] = None) -> Dict[str, Any]:
     parsed = []
     for v in votes:
         value, ok = verdict_to_value(c, v.data.get("verdict"))
@@ -96,6 +110,13 @@ def aggregate_votes(c: Dict[str, Any], votes: List[LLMResult], facts: Dict[str, 
     if evidence_fallback:
         evidence = _default_evidence(c["id"], facts)
         confidence = min(confidence, 0.5)
+    vote_rows = [
+        {"verdict": v.data.get("verdict"), "rationale": v.data.get("rationale"),
+         "evidence_turns": v.data.get("evidence_turns"), "confidence": v.data.get("confidence"), "model": v.model,
+         **{k: value for k, value in (v.extra.get("provenance") or {}).items() if k in ("provider", "local")}}
+        for v in votes
+    ]
+    metadata = _vote_metadata(c, vote_rows, requested_votes if requested_votes is not None else len(votes))
     return {
         "value": final,
         "verdict": rep.data.get("verdict"),
@@ -106,12 +127,9 @@ def aggregate_votes(c: Dict[str, Any], votes: List[LLMResult], facts: Dict[str, 
         "agreement": round(agreement, 2),
         "model_confidence": round(max(0.0, min(1.0, model_conf)), 2),
         "confidence": confidence,
-        "needs_review": evidence_fallback or agreement < 1.0 or model_conf < 0.6,
-        "votes": [
-            {"verdict": v.data.get("verdict"), "rationale": v.data.get("rationale"),
-             "evidence_turns": v.data.get("evidence_turns"), "confidence": v.data.get("confidence"), "model": v.model}
-            for v in votes
-        ],
+        "needs_review": evidence_fallback or agreement < 1.0 or model_conf < 0.6 or not metadata["votes_complete"],
+        "votes": vote_rows,
+        **metadata,
     }
 
 
@@ -162,8 +180,6 @@ def _reusable(previous: Optional[Dict[str, Any]], client: Any, votes: int, in_ha
         return False
     if previous.get("model") != getattr(client, "model", None):
         return False
-    if int(previous.get("votes") or 0) < votes:
-        return False
     prev_hash = previous.get("input_hash")
     return prev_hash is None or prev_hash == in_hash
 
@@ -194,17 +210,41 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
         h = criterion_hash(c, checklist)
         hashes[c["id"]] = h
         prev = prev_rows.get(c["id"])
-        if prev and prev.get("def_hash") == h and c["id"] not in force:
+        saved_votes = (prev or {}).get("votes") or []
+        enough_votes = (isinstance(saved_votes, list) and all(isinstance(v, dict) for v in saved_votes)
+                        and _vote_metadata(c, saved_votes, votes)["votes_complete"])
+        if prev and prev.get("def_hash") == h and c["id"] not in force and enough_votes:
             keep = {k: prev.get(k) for k in ("value", "verdict", "rationale", "analysis", "evidence_turns", "agreement",
                                               "model_confidence", "confidence", "needs_review", "votes")}
             keep["evidence_fallback"] = bool(prev.get("evidence_fallback"))
+            keep.update(_vote_metadata(c, saved_votes, votes))
+            keep["attempt_errors"] = list(prev.get("attempt_errors") or [])
+            keep["needs_review"] = (keep["evidence_fallback"] or (keep.get("agreement") or 0) < 1.0
+                                    or (keep.get("model_confidence") or 0) < 0.6)
             rows[c["id"]] = _criterion_row(c, keep, h, reused=True)
         else:
             todo.append(c)
 
     usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cost_usd": 0.0}
     errors: List[str] = []
+    attempt_errors: List[Dict[str, Any]] = []
+    errors_by_cid: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    model_provenance: List[Dict[str, Any]] = []
     votes_by_cid: Dict[str, List[LLMResult]] = defaultdict(list)
+
+    def remember_provenance(value: Dict[str, Any]) -> None:
+        provenance = {k: value[k] for k in ("model", "provider", "local") if k in value}
+        if provenance.get("model") and provenance not in model_provenance:
+            model_provenance.append(provenance)
+
+    def record_errors(label: str, values: List[Dict[str, Any]]) -> None:
+        for value in values:
+            error = {k: value[k] for k in ("model", "provider", "local", "error_type") if k in value}
+            error["scope"] = label
+            attempt_errors.append(error)
+            remember_provenance(error)
+            for criterion in todo if label == "batch" else [c for c in todo if c["id"] == label]:
+                errors_by_cid[criterion["id"]].append(error)
 
     def account(r: LLMResult) -> None:
         usage["calls"] += 1
@@ -219,9 +259,12 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
             try:
                 r = f.result()
                 account(r)
+                remember_provenance(r.extra.get("provenance") or {"model": r.model})
+                record_errors(label, r.extra.get("attempt_errors") or [])
                 got.append(r)
             except Exception as exc:  # noqa: BLE001 — фиксируем любую ошибку провайдера
-                errors.append(f"{label}: {exc}")
+                record_errors(label, getattr(exc, "attempt_errors", None) or [{"error_type": type(exc).__name__}])
+                errors.append(f"{label}: запрос модели не выполнен ({type(exc).__name__})")
         return got
 
     if todo and mode == "batch":
@@ -231,8 +274,8 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
             items = _batch_items(r.data)
             for c in todo:
                 item = items.get(c["id"])
-                if isinstance(item, dict):
-                    votes_by_cid[c["id"]].append(LLMResult(data=item, raw="", model=r.model))
+                votes_by_cid[c["id"]].append(LLMResult(data=item if isinstance(item, dict) else {}, raw="",
+                                                       model=r.model, extra=r.extra))
     elif todo:
         futures = {}
         for c in todo:
@@ -246,7 +289,9 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
         for rnd in range(3):  # голоса пакета + до двух дозапросов по одному критерию, если ответы недопустимы или упали
             if results:
                 try:
-                    rows[c["id"]] = _criterion_row(c, aggregate_votes(c, results, facts), hashes[c["id"]], reused=False)
+                    aggregate = aggregate_votes(c, results, facts, requested_votes=votes)
+                    aggregate["attempt_errors"] = list(errors_by_cid[c["id"]])
+                    rows[c["id"]] = _criterion_row(c, aggregate, hashes[c["id"]], reused=False)
                     break
                 except LLMError as exc:
                     errors.append(str(exc))
@@ -256,6 +301,20 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
             need = max(1, votes // 2 + 1)
             results = results + collect(c["id"], [pool.submit(panel.complete_json, messages, response_schema(c), offset + 3 + rnd * need + k)
                                                   for k in range(need)])
+        votes_by_cid[c["id"]] = results
+
+    vote_counts = {}
+    for c in checklist["criteria"]:
+        row = rows.get(c["id"])
+        if row is not None:
+            vote_counts[c["id"]] = {k: row[k] for k in ("requested_votes", "received_votes", "valid_votes", "votes_complete", "review_reason")}
+            for vote in row["votes"]:
+                remember_provenance(vote)
+        else:
+            vote_counts[c["id"]] = _vote_metadata(c, [dict(v.data, model=v.model) for v in votes_by_cid[c["id"]]], votes)
+    incomplete = [cid for cid, counts in vote_counts.items() if not counts["votes_complete"]]
+    actual_models = sorted({v["model"] for row in rows.values() for v in row["votes"] if v.get("model")}
+                           | {v.model for values in votes_by_cid.values() for v in values if v.model})
 
     base = {
         "conversation_id": conv["conversation_id"],
@@ -266,6 +325,17 @@ def evaluate_conversation(conv: Dict[str, Any], checklist: Dict[str, Any], clien
         "checklist_id": checklist.get("_id"),
         "model": getattr(client, "model", "unknown"),
         "votes": votes,
+        "requested_votes": votes,
+        "received_votes": min((x["received_votes"] for x in vote_counts.values()), default=0),
+        "valid_votes": min((x["valid_votes"] for x in vote_counts.values()), default=0),
+        "votes_complete": not incomplete,
+        "incomplete_criteria": incomplete,
+        "vote_counts": vote_counts,
+        "actual_models": actual_models,
+        "model_provenance": model_provenance,
+        "attempt_errors": attempt_errors,
+        "needs_review": bool(incomplete) or any(row.get("needs_review") for row in rows.values()),
+        "review_reason": vote_counts[incomplete[0]]["review_reason"] if incomplete else None,
         "input_hash": in_hash,
         "llm_mode": mode,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -297,7 +367,11 @@ def evaluate_many(convs: List[Dict[str, Any]], checklist: Dict[str, Any], client
                 result = evaluate_conversation(conv, checklist, client, votes, previous.get(conv["conversation_id"]), force)
             except Exception as exc:  # noqa: BLE001
                 result = {"conversation_id": conv["conversation_id"], "status": "error", "criteria": [], "score": None,
-                          "error": f"{type(exc).__name__}: {exc}"}
+                          "error": f"Оценка не завершена ({type(exc).__name__})",
+                          "requested_votes": votes or settings.llm_votes, "votes_complete": False,
+                          "needs_review": True, "review_reason": "Проверки не завершены: ошибка оценки",
+                          "actual_models": [], "model_provenance": [],
+                          "attempt_errors": [{"scope": "evaluation", "error_type": type(exc).__name__}]}
             if result.get("status") == "ok":
                 break
         if on_done:

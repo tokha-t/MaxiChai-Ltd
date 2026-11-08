@@ -295,7 +295,9 @@ details > summary + * { margin-top: 8px; }
 .filter-fields { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; padding: 10px 0; }
 .filter-fields .field { flex: 1 1 140px; }
 .filter-fields .check { min-height: 42px; }
+.service-tools { min-width: 0; max-width: 100%; }
 .service-content { max-width: 650px; }
+select[data-profile] { width: 100%; min-width: 0; }
 .service-actions, .selection-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
 .selection-actions { justify-content: flex-end; }
 .list-summary p { margin: 4px 0; }

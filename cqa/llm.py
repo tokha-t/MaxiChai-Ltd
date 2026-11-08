@@ -276,13 +276,30 @@ class JudgePanel:
     def complete_json(self, messages: List[Dict[str, str]], schema: Optional[Dict[str, Any]] = None, start: int = 0) -> LLMResult:
         """Один вызов: пробует судей по кругу, пока кто-то не ответит."""
         last: Optional[Exception] = None
+        attempts: List[Dict[str, Any]] = []
         live = self.alive()
         for k in range(len(live)):
             judge = live[(start + k) % len(live)]
+            spec = getattr(judge, "spec", None)
+            provenance = {"model": judge.model}
+            if spec is not None:
+                provenance.update(provider=spec.provider, local=bool(spec.local))
+            elif isinstance(judge, MockClient):
+                provenance.update(provider="mock", local=True)
             try:
-                return judge.complete_json(messages, schema)
-            except LLMError as exc:
+                result = judge.complete_json(messages, schema)
+                result.extra["provenance"] = dict(provenance, model=result.model)
+                result.extra["attempt_errors"] = attempts
+                return result
+            except Exception as exc:
+                # Exception text can contain request URLs, keys or provider response bodies.
+                attempts.append(dict(provenance, error_type=type(exc).__name__))
+                if not isinstance(exc, LLMError):
+                    exc.attempt_errors = attempts
+                    raise
                 last = exc
+        if last is not None:
+            last.attempt_errors = attempts
         raise last or LLMError("Нет доступных судей")
 
 

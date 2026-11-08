@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -19,6 +20,10 @@ CREATE TABLE IF NOT EXISTS conversations (
   language TEXT,
   data_json TEXT NOT NULL,
   imported_at TEXT
+);
+CREATE TABLE IF NOT EXISTS dataset_manifests (
+  group_id TEXT PRIMARY KEY,
+  manifest_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS checklists (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,6 +110,37 @@ class Store:
         return conn
 
     # ---------- диалоги ----------
+    def get_dataset_manifest(self, group_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT manifest_json FROM dataset_manifests WHERE group_id=?", (group_id,)).fetchone()
+        return json.loads(row["manifest_json"]) if row else None
+
+    def register_dataset_manifest(self, records: List[Dict[str, Any]], group_id: str,
+                                  source: str = "organizer") -> Dict[str, Any]:
+        """Неизменяемый состав исходного импорта; ручная загрузка диалогов его не создаёт."""
+        from .dataset import normalize_record
+        from .evaluator import input_hash
+        if not group_id or source not in ("organizer", "cache", "file"):
+            raise ValueError("Для манифеста нужны group_id и источник исходного набора")
+        records = [normalize_record(r) for r in records]
+        ids = [r["conversation_id"] for r in records]
+        if not ids or any(not cid for cid in ids) or len(set(ids)) != len(ids):
+            raise ValueError("В исходном наборе нужны непустые уникальные conversation_id")
+        hashes = {r["conversation_id"]: input_hash(r) for r in records}
+        counts = {r["conversation_id"]: len(r["transcript"]) for r in records}
+        digest = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode("utf-8")).hexdigest()
+        manifest = {"group_id": group_id, "source": source, "conversation_ids": ids,
+                    "input_hashes": hashes, "turn_counts": counts, "manifest_hash": digest, "created_at": _now()}
+        with _lock:
+            previous = self.get_dataset_manifest(group_id)
+            if previous:
+                if previous["input_hashes"] != hashes or previous["turn_counts"] != counts:
+                    raise ValueError(f"Состав или входные данные набора {group_id} отличаются от исходного манифеста")
+                return previous
+            self.conn.execute("INSERT INTO dataset_manifests(group_id, manifest_json) VALUES(?,?)",
+                              (group_id, json.dumps(manifest, ensure_ascii=False)))
+            self.conn.commit()
+        return manifest
+
     def upsert_conversations(self, records: List[Dict[str, Any]], group_id: str) -> int:
         with _lock:
             for r in records:
@@ -222,6 +258,7 @@ class Store:
         res = json.loads(row["result_json"])
         res["_id"] = row["id"]
         res["_checklist_id"] = row["checklist_id"]
+        res["_stored_status"] = row["status"]
         return res
 
     def latest_evaluation(self, cid: str, checklist_id: Optional[int] = None, ok_only: bool = False) -> Optional[Dict[str, Any]]:

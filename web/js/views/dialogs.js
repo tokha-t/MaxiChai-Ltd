@@ -1,6 +1,7 @@
 // Список диалогов: рабочая выборка оператора и отдельные служебные действия проверяющего.
 import { api, qs } from "../api.js";
-import { channelIcon, errorToast, esc, fmtDate, fmtScore, h, icon, jobBox, modal, state, toast, refreshJobs, hasRunningJob, notifyJobStarted } from "../ui.js";
+import { channelIcon, errorToast, esc, fmtDate, fmtScore, h, icon, jobBox, modal, state, toast, refreshJobs, hasRunningJob, notifyJobStarted, profileOptions } from "../ui.js";
+import { checksSummary, profileId, selectedProfile } from "../evaluation-meta.js";
 import { DIALOG_FILTER_DEFAULTS, readDialogFilters, dialogListHash, dialogScore, visibleDialogRows, summarizeDialogRows, dialogScopeCount } from "../dialog-list-model.js";
 
 const trackedJobs = new Map();
@@ -12,6 +13,7 @@ let filtersOpen = false;
 let serviceOpen = false;
 let searchEditing = false;
 const selected = new Set();
+let profiles = [];
 const busy = () => startingJob || trackedJobs.size > 0 || hasRunningJob();
 
 window.addEventListener("cqa:jobs", (event) => {
@@ -32,13 +34,14 @@ export async function renderDialogs(root, params = [], query = null, alive = () 
   const observer = { alive: isCurrent, busy: () => {}, tick: () => {}, done: refresh };
   listObserver = observer;
   const f = readDialogFilters(query, state.dialogFilters);
+  if (f.checklist_id) state.evaluationChecklistId = profileId(f.checklist_id);
   Object.assign(state.dialogFilters, f);
   saveFilterUrl(f, true);
   const reviewer = state.role === "reviewer";
   root.setAttribute("aria-busy", "true");
-  let groups, serverRows, cfg, settings, running, capability, activeChecklist;
+  let groups, serverRows, cfg, settings, running, capability, activeChecklist, availableProfiles;
   try {
-    [groups, serverRows, cfg, settings, running, capability, activeChecklist] = await Promise.all([
+    [groups, serverRows, cfg, settings, running, capability, activeChecklist, availableProfiles] = await Promise.all([
       api.get("/api/groups"),
       api.get("/api/conversations" + qs({ group_id: f.group_id, language: f.language, channel: f.channel, critical: f.critical || undefined, needs_review: f.needs_review || undefined, q: f.q, criterion_id: f.criterion_id, criterion_violation: f.criterion_id ? f.criterion_violation : undefined })),
       reviewer ? api.get("/api/config").catch(() => null) : null,
@@ -46,6 +49,7 @@ export async function renderDialogs(root, params = [], query = null, alive = () 
       refreshJobs().then((jobs) => { jobsUnavailable = false; return jobs; }).catch(() => { jobsUnavailable = true; return []; }),
       f.criterion_id ? api.get("/api/stats" + qs({ group_id: f.group_id })) : null,
       api.get("/api/checklists/active").catch(() => null),
+      reviewer ? api.get("/api/checklists") : [],
     ]);
   } catch {
     if (!isCurrent()) return;
@@ -56,6 +60,7 @@ export async function renderDialogs(root, params = [], query = null, alive = () 
     return;
   }
   if (!isCurrent()) return;
+  profiles = availableProfiles;
   root.removeAttribute("aria-busy");
   const unsupportedCriterion = !!f.criterion_id && capability?.criterion_filter_supported !== true;
   const rows = unsupportedCriterion ? [] : visibleDialogRows(serverRows, f);
@@ -128,6 +133,10 @@ export async function renderDialogs(root, params = [], query = null, alive = () 
   });
   root.querySelector(".list-filters").addEventListener("toggle", (event) => { filtersOpen = event.currentTarget.open; });
   root.querySelector(".service-tools")?.addEventListener("toggle", (event) => { serviceOpen = event.currentTarget.open; });
+  root.querySelector("[data-profile]")?.addEventListener("change", (event) => {
+    state.evaluationChecklistId = profileId(event.target.value);
+    changeFilters({ checklist_id: event.target.value });
+  });
   root.querySelectorAll('[data-act="clear-search"]').forEach((button) => button.addEventListener("click", () => changeFilters({ q: "" })));
   root.querySelectorAll('[data-act="reset-filters"]').forEach((button) => button.addEventListener("click", () => changeFilters({ ...DIALOG_FILTER_DEFAULTS, sort: f.sort })));
   root.querySelectorAll('[data-act="clear-criterion"]').forEach((button) => button.addEventListener("click", () => changeFilters({ criterion_id: "", criterion_violation: false })));
@@ -177,14 +186,7 @@ export async function renderDialogs(root, params = [], query = null, alive = () 
   root.querySelectorAll('[data-act="fetch"]').forEach((button) => button.addEventListener("click", () => fetchModal(refresh)));
   root.querySelectorAll('[data-act="upload"]').forEach((button) => button.addEventListener("click", () => uploadModal(refresh, alive)));
   root.querySelector('[data-act="save"]')?.addEventListener("click", () => saveModal(groups, f.group_id));
-  root.querySelector('[data-act="export"]')?.addEventListener("click", async () => {
-    try {
-      if (!groups.length) throw new Error("Сначала загрузите диалоги");
-      if (f.group_id) await downloadResults(f.group_id);
-      else if (groups.length === 1) await downloadResults(groups[0].group_id);
-      else saveModal(groups, f.group_id);
-    } catch (error) { errorToast(error); }
-  });
+  root.querySelector('[data-act="export"]')?.addEventListener("click", () => saveModal(groups, f.group_id));
   for (const job of running) followJob(job.job_id, job);
   observer.tick(); syncBusy();
   if (focusKey) {
@@ -195,6 +197,8 @@ export async function renderDialogs(root, params = [], query = null, alive = () 
 
 function serviceHtml(cfg, settings, filters, open) {
   return `<details class="service-tools" ${open ? "open" : ""}><summary class="btn">${icon("settings")} Служебные действия</summary><div class="service-content">
+    <label class="field"><span>Профиль для запуска и выгрузки</span><select data-profile>${profileOptions(profiles, state.evaluationChecklistId)}</select></label>
+    <p class="small muted">Выберите сохранённую версию явно. Этот профиль будет указан в запуске и выгрузке; смена активной версии не подменяет выбор.</p>
     <p class="small muted">Импорт, запуск оценки и JSON для сдачи. Демо-режим проверяющего не заменяет авторизацию.</p>
     <div class="service-actions"><button class="btn" data-start data-act="fetch">${icon("download")} Загрузить набор из API</button><button class="btn" data-start data-act="upload">${icon("plus")} Добавить диалог</button>
       <button class="btn" data-start data-act="eval-visible">Оценить текущую выборку</button><button class="btn" data-start data-act="eval-group">${filters.group_id ? "Оценить всю группу" : "Оценить все группы"}</button>
@@ -240,6 +244,7 @@ function rowHtml(row, reviewer, activeVersion) {
 function evaluationPreview(scope) {
   if (busy() || jobsUnavailable || !scope.count || state.role !== "reviewer") return;
   const body = h(`<div class="stack"><p><b>Диалогов: ${scope.count}</b> · ${esc(scope.scope)}</p>
+    <label class="field"><span>Сохранённый профиль</span><select data-profile>${profileOptions(profiles, state.evaluationChecklistId)}</select></label>
     <label class="field"><span>Режим оценки</span><select data-mode><option value="reuse">Переиспользовать подходящие сохранённые результаты</option><option value="new">Новый анализ всех критериев</option></select></label>
     <p class="small muted" data-mode-description>Сервер переиспользует подходящие ответы для неизменённых критериев и пересчитает итог. Новые или изменённые критерии потребуют проверки моделью.</p>
     <label class="field"><span>Число проверок</span><select data-votes><option value="3" selected>Три проверки</option><option value="1">Одна проверка</option></select></label>
@@ -247,16 +252,16 @@ function evaluationPreview(scope) {
   body.querySelector("[data-mode]").addEventListener("change", (event) => { body.querySelector("[data-mode-description]").textContent = event.target.value === "new" ? "Будет выполнен новый анализ всех критериев. Сохранённые ответы не переиспользуются." : "Сервер переиспользует подходящие ответы для неизменённых критериев и пересчитает итог. Новые или изменённые критерии потребуют проверки моделью."; });
   modal({ title: "Запуск оценки", body, actions: [{ label: "Отмена" }, { label: `Начать оценку (${scope.count})`, kind: "primary", onClick: async () => {
     if (busy() || state.role !== "reviewer") throw new Error("Дождитесь завершения текущей оценки");
+    const checklist = requireProfile(body.querySelector("[data-profile]").value);
+    rememberProfile(checklist.id);
     startingJob = true; listObserver?.busy();
     try {
       const running = await refreshJobs();
       if (running.length) throw new Error("Оценка уже выполняется. Дождитесь завершения текущей задачи.");
-      const request = { votes: Number(body.querySelector("[data-votes]").value), reuse: body.querySelector("[data-mode]").value === "reuse" };
+      const request = { checklist_id: checklist.id, votes: Number(body.querySelector("[data-votes]").value), reuse: body.querySelector("[data-mode]").value === "reuse" };
       if (scope.conversation_ids) request.conversation_ids = scope.conversation_ids;
       else request.group_id = scope.group_id;
-      let result;
-      try { result = await api.post("/api/evaluate", request); }
-      catch { throw new Error("Не удалось запустить оценку. Проверьте доступность сервера и настройки оценки."); }
+      const result = await api.post("/api/evaluate", request);
       notifyJobStarted(); followJob(result.job_id);
     } finally { startingJob = false; listObserver?.busy(); }
   } }] });
@@ -277,7 +282,9 @@ function followJob(jobId, initial = null) {
           trackedJobs.delete(jobId);
           await notifyJobStarted();
           const errors = (job.results || []).filter((row) => row.status !== "ok");
+          const incomplete = job.incomplete_count ?? (typeof job.incomplete === "number" ? job.incomplete : (job.results || []).filter((row) => checksSummary(row, job.votes).incomplete).length);
           if (job.status === "failed" || errors.length) toast("Оценка завершилась с ошибками. Откройте карточки диалогов, чтобы проверить результат.", "error");
+          else if (incomplete) toast(`Обработано: ${job.done}. Неполные проверки: ${incomplete}; откройте карточки для проверки.`, "error");
           else toast(`Оценено диалогов: ${job.done}`, "ok");
           listObserver?.busy(); await listObserver?.done();
           return job;
@@ -292,14 +299,28 @@ function followJob(jobId, initial = null) {
   return tracked.task;
 }
 
-async function downloadResults(group) {
+function requireProfile(value) {
+  const checklist = selectedProfile(profiles, value);
+  if (!checklist) throw new Error("Выберите сохранённый профиль правил");
+  return checklist;
+}
+
+function rememberProfile(id) {
+  state.evaluationChecklistId = id;
+  state.dialogFilters.checklist_id = String(id);
+  if (location.hash.startsWith("#/dialogs")) saveFilterUrl(state.dialogFilters, true);
+  const selector = document.querySelector(".service-tools [data-profile]");
+  if (selector) selector.value = String(id);
+}
+
+async function downloadResults(group, target, checklistId, source = "ai") {
   if (!group) throw new Error("Выберите группу для экспорта");
-  const data = await api.get("/api/export" + qs({ group_id: group }));
+  const data = await api.get("/api/export" + qs({ group_id: group, target, checklist_id: checklistId, source }));
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = "results.json";
+  link.download = source === "final" ? "diagnostic_final_results.json" : "results.json";
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
@@ -408,21 +429,49 @@ function uploadModal(onDone, alive) {
 }
 
 function saveModal(groups, selectedGroup = "") {
+  if (!groups.length) { errorToast(new Error("Сначала загрузите диалоги")); return; }
   const body = h(`<div class="stack">
-    <p class="muted">Сохраняет оценки системы (без ручных правок по апелляциям) в формате сдачи 1.0 прямо в папку проекта и проверяет формат.</p>
+    <p class="muted">Для сдачи выбираются исходные оценки ИИ по указанному профилю. Скачивание и сохранение проходят одинаковую проверку происхождения, состава набора и формата 1.0.</p>
+    <label class="field"><span>Сохранённый профиль</span><select data-profile>${profileOptions(profiles, state.evaluationChecklistId)}</select></label>
+    <p class="small muted">Для исторических результатов DEV можно явно выбрать v1. Выбор версии не пересчитывает оценки и не переименовывает их.</p>
     <div class="row">
       <label class="field"><span>Группа</span><select data-g>${groups.map((g) => `<option value="${esc(g.group_id)}">${esc(g.group_id)} (${g.count})</option>`).join("")}</select></label>
       <label class="field"><span>Куда</span><select data-t><option value="dev">results/dev/results.json</option><option value="prod">results/prod/results.json</option></select></label>
     </div>
     <div data-out></div></div>`);
   if (selectedGroup) body.querySelector("[data-g]").value = selectedGroup;
+  const exportRequest = (b) => {
+    const checklist = requireProfile(b.querySelector("[data-profile]").value);
+    rememberProfile(checklist.id);
+    return { group_id: b.querySelector("[data-g]").value, target: b.querySelector("[data-t]").value, checklist_id: checklist.id };
+  };
+  const showError = (b, error) => {
+    b.querySelector("[data-out]").innerHTML = `<div class="errors" role="alert"><b>Выгрузка не выполнена.</b><p>${esc(error.message).replace(/\n/g, "<br>")}</p></div>`;
+  };
   modal({
     title: "Результаты в формате JSON для сдачи", body,
     actions: [
-      { label: "Скачать результаты", onClick: async ({ body: b }) => { await downloadResults(b.querySelector("[data-g]").value); return true; } },
+      { label: "Скачать для сдачи", onClick: async ({ body: b }) => {
+        try {
+          const request = exportRequest(b);
+          await downloadResults(request.group_id, request.target, request.checklist_id);
+          b.querySelector("[data-out]").innerHTML = `<div class="okbox">Проверенный файл подготовлен к скачиванию.</div>`;
+        } catch (error) { showError(b, error); }
+        return true;
+      } },
+      { label: "Диагностика после апелляций", onClick: async ({ body: b }) => {
+        try {
+          const request = exportRequest(b);
+          await downloadResults(request.group_id, undefined, request.checklist_id, "final");
+          b.querySelector("[data-out]").innerHTML = `<div class="notice">Диагностический файл после апелляций подготовлен к скачиванию. Он не предназначен для официальной сдачи.</div>`;
+        } catch (error) { showError(b, error); }
+        return true;
+      } },
       {
         label: "Сохранить в проект", kind: "primary", onClick: async ({ body: b }) => {
-          const res = await api.post("/api/results/save", { group_id: b.querySelector("[data-g]").value, target: b.querySelector("[data-t]").value });
+          let res;
+          try { res = await api.post("/api/results/save", exportRequest(b)); }
+          catch (error) { showError(b, error); return true; }
           const out = b.querySelector("[data-out]");
           const errors = Array.isArray(res.errors) ? res.errors : [];
           const warnings = Array.isArray(res.warnings) ? res.warnings : [];
